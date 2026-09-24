@@ -1,0 +1,12 @@
+# spec §13–14 — BNO085/086 on torso, quaternion primary.
+imu:
+  driver: bno08x  # e.g. ros-bno08x or custom humanoid_imu node (Milestone 2)
+  i2c_bus: 1
+  i2c_address: "0x4A"   # BNO085 default 0x4A (alt 0x4B); confirm jumper
+  frame_id: imu_link
+  parent_frame: torso_link
+  mount_xyz_rpy: [0.0, 0.0, 0.10, 0.0, 0.0, 0.0]  # rigid torso mount; measure on rig
+  topic_data: /imu/data
+  publish_rate_hz: 100.0
+  use_magnetometer: true
+  orientation_primary: quaternion

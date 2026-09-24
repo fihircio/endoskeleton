@@ -1,0 +1,49 @@
+<?xml version="1.0"?>
+<!-- Torso chain: pelvis -> torso_yaw -> torso_pitch -> torso_link (spec sections 8, 22) -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="torso_chain">
+    <link name="torso_yaw_link">
+      <visual>
+        <origin xyz="0 0 0.03" rpy="0 0 0"/>
+        <geometry><cylinder radius="0.09" length="0.06"/></geometry>
+        <material name="joint_dark"/>
+      </visual>
+      <inertial>
+        <mass value="0.5"/>
+        <origin xyz="0 0 0"/>
+        <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/>
+      </inertial>
+    </link>
+    <joint name="torso_yaw" type="revolute">
+      <parent link="pelvis_link"/>
+      <child link="torso_yaw_link"/>
+      <origin xyz="0 0 0.06" rpy="0 0 0"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="-1.20" upper="1.20" effort="10" velocity="1.5"/>
+    </joint>
+
+    <link name="torso_link">
+      <visual>
+        <origin xyz="0 0 0.17" rpy="0 0 0"/>
+        <geometry><box size="0.20 0.32 0.35"/></geometry>
+        <material name="torso_grey"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0.17" rpy="0 0 0"/>
+        <geometry><box size="0.20 0.32 0.35"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="3.0"/>
+        <origin xyz="0 0 0.17"/>
+        <inertia ixx="0.04" ixy="0" ixz="0" iyy="0.03" iyz="0" izz="0.04"/>
+      </inertial>
+    </link>
+    <joint name="torso_pitch" type="revolute">
+      <parent link="torso_yaw_link"/>
+      <child link="torso_link"/>
+      <origin xyz="0 0 0.03" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="-0.40" upper="0.40" effort="10" velocity="1.5"/>
+    </joint>
+  </xacro:macro>
+</robot>

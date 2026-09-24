@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<robot name="humanoid_v1" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:include filename="$(find humanoid_description)/urdf/materials.xacro"/>
+  <xacro:include filename="$(find humanoid_description)/urdf/torso.xacro"/>
+  <xacro:include filename="$(find humanoid_description)/urdf/head.xacro"/>
+  <xacro:include filename="$(find humanoid_description)/urdf/left_arm.xacro"/>
+  <xacro:include filename="$(find humanoid_description)/urdf/right_arm.xacro"/>
+  <xacro:include filename="$(find humanoid_description)/urdf/sensors.xacro"/>
+
+  <!-- Base: pelvis origin. All dims in meters. PLACEHOLDER — measure rig (§48). -->
+  <link name="base_link"/>
+  <link name="pelvis_link">
+    <visual>
+      <origin xyz="0 0 0.0" rpy="0 0 0"/>
+      <geometry><box size="0.20 0.28 0.12"/></geometry>
+      <material name="torso_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.0" rpy="0 0 0"/>
+      <geometry><box size="0.20 0.28 0.12"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="2.0"/>
+      <origin xyz="0 0 0"/>
+      <inertia ixx="0.02" ixy="0" ixz="0" iyy="0.02" iyz="0" izz="0.02"/>
+    </inertial>
+  </link>
+  <joint name="base_to_pelvis" type="fixed">
+    <parent link="base_link"/>
+    <child link="pelvis_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:torso_chain/>
+  <xacro:head_chain/>
+  <xacro:left_arm_chain/>
+  <xacro:right_arm_chain/>
+  <xacro:sensor_links/>
+</robot>

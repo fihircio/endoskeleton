@@ -1,0 +1,19 @@
+# spec §8–9 — 16-DOF upper body. Only 3 PHYSICAL in V1; rest SIMULATED.
+# Angles in radians. Soft limits are conservative for hobby servos (spec §59).
+joints:
+  torso_yaw:         {mode: simulated, min: -1.20, max: 1.20,  initial: 0.0}
+  torso_pitch:       {mode: simulated, min: -0.40, max: 0.40,  initial: 0.0}
+  head_pan:          {mode: physical,  min: -1.40, max: 1.40,  initial: 0.0}
+  head_tilt:         {mode: simulated, min: -0.50, max: 0.50,  initial: 0.0}
+  left_shoulder_pitch:  {mode: simulated, min: -2.60, max: 2.60, initial: 0.0}
+  left_shoulder_roll:   {mode: simulated, min: -1.40, max: 1.40, initial: 0.0}
+  left_shoulder_yaw:    {mode: simulated, min: -1.40, max: 1.40, initial: 0.0}
+  left_elbow_pitch:     {mode: physical,  min: 0.17, max: 2.97, initial: 1.57}
+  left_wrist_pitch:     {mode: simulated, min: -1.20, max: 1.20, initial: 0.0}
+  left_wrist_yaw:       {mode: simulated, min: -1.20, max: 1.20, initial: 0.0}
+  right_shoulder_pitch: {mode: simulated, min: -2.60, max: 2.60, initial: 0.0}
+  right_shoulder_roll:  {mode: simulated, min: -1.40, max: 1.40, initial: 0.0}
+  right_shoulder_yaw:   {mode: simulated, min: -1.40, max: 1.40, initial: 0.0}
+  right_elbow_pitch:    {mode: physical,  min: 0.17, max: 2.97, initial: 1.57}
+  right_wrist_pitch:    {mode: simulated, min: -1.20, max: 1.20, initial: 0.0}
+  right_wrist_yaw:      {mode: simulated, min: -1.20, max: 1.20, initial: 0.0}

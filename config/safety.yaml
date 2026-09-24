@@ -1,0 +1,11 @@
+# spec §26–27 — safety states and rules.
+states: [BOOT, DISABLED, READY, ACTIVE, FAULT, EMERGENCY_STOP]
+topics:
+  state: /safety_state
+  enable_service: /servo/enable
+  estop_service: /servo/estop
+rules:
+  software_enabled_separate_from_motor_power: true
+  boot_sequence: [POWER_ON, READ_CONFIG, READ_JOINT_STATE, WAIT_FOR_ENABLE, MOVE_SLOWLY_TO_INITIAL]
+  command_timeout_action: HOLD
+  estop_latches_until_manual_reset: true

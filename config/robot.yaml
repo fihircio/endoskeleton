@@ -1,0 +1,21 @@
+# spec §8, §48 — never hard-code these in source
+robot_name: humanoid_v1
+dof_total: 16
+dof_physical: 3
+physical_joints:
+  - head_pan
+  - left_elbow_pitch
+  - right_elbow_pitch
+frames:
+  base: base_link
+  torso: torso_link
+  imu: imu_link
+  lidar: lidar_link
+topics:
+  joint_commands: /joint_commands
+  joint_states: /joint_states
+  robot_state: /robot_state
+  servo_status: /servo_status
+  safety_state: /safety_state
+  scan: /scan
+  imu: /imu/data

@@ -1,0 +1,11 @@
+# spec §15 — Hokuyo UST-10LX. Never hard-code IP in source.
+lidar:
+  driver: urg_node   # ROS 2 Humble: urg_node supports UST-10LX over Ethernet
+  ip_address: "192.168.0.10"   # configure per network (§4); override via env LIDAR_IP
+  port: 10940
+  frame_id: lidar_link
+  scan_topic: /scan
+  publish_rate_hz: 40.0
+  range_min_m: 0.06
+  range_max_m: 10.0
+  mount_xyz_rpy: [0.0, 0.0, 0.25, 0.0, 0.0, 0.0]  # relative to torso_link; measure on rig

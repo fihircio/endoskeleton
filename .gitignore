@@ -1,0 +1,19 @@
+# ROS 2 build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets / local overrides
+*.local.yaml
+.env

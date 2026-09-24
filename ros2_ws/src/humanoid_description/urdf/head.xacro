@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<!-- Head: head_pan (PHYSICAL, DS3109MG) + head_tilt (SIMULATED). Cameras mount on head_link. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="head_chain">
+    <link name="head_pan_link">
+      <visual>
+        <origin xyz="0 0 0.02" rpy="0 0 0"/>
+        <geometry><cylinder radius="0.05" length="0.04"/></geometry>
+        <material name="joint_dark"/>
+      </visual>
+      <inertial>
+        <mass value="0.2"/>
+        <origin xyz="0 0 0"/>
+        <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+      </inertial>
+    </link>
+    <joint name="head_pan" type="revolute">
+      <parent link="torso_link"/>
+      <child link="head_pan_link"/>
+      <!-- top of torso box (0.17 + 0.175 = 0.345) -->
+      <origin xyz="0 0 0.345" rpy="0 0 0"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="-1.40" upper="1.40" effort="5" velocity="3.0"/>
+    </joint>
+
+    <link name="head_link">
+      <visual>
+        <origin xyz="0 0 0.07" rpy="0 0 0"/>
+        <geometry><box size="0.16 0.18 0.14"/></geometry>
+        <material name="head_blue"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0.07" rpy="0 0 0"/>
+        <geometry><box size="0.16 0.18 0.14"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="0.8"/>
+        <origin xyz="0 0 0.07"/>
+        <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/>
+      </inertial>
+    </link>
+    <joint name="head_tilt" type="revolute">
+      <parent link="head_pan_link"/>
+      <child link="head_link"/>
+      <origin xyz="0 0 0.02" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="-0.50" upper="0.50" effort="5" velocity="3.0"/>
+    </joint>
+  </xacro:macro>
+</robot>

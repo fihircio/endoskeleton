@@ -1,0 +1,45 @@
+# spec §10–12 — PCA9685 calibration. YAML only, never in source.
+# V1 allocation (§2.5): MG995#1 → left elbow, MG995#2 → right elbow, DS3109MG → neck pan.
+pca9685:
+  board_1: {i2c_bus: 1, i2c_address: "0x40", pwm_freq_hz: 50}
+  board_2: {i2c_bus: 1, i2c_address: "0x41", pwm_freq_hz: 50}  # reserved for future joints
+
+servos:
+  left_elbow_pitch:
+    board: board_1
+    channel: 0
+    model: MG995
+    min_angle_deg: 10.0
+    max_angle_deg: 170.0
+    center_angle_deg: 90.0
+    reverse: false
+    pwm_min_us: 500
+    pwm_max_us: 2500
+    max_speed_deg_s: 60.0   # slow moves for safety (§12, §59)
+  right_elbow_pitch:
+    board: board_1
+    channel: 1
+    model: MG995
+    min_angle_deg: 10.0
+    max_angle_deg: 170.0
+    center_angle_deg: 90.0
+    reverse: true   # mirrored arm — verify on hardware
+    pwm_min_us: 500
+    pwm_max_us: 2500
+    max_speed_deg_s: 60.0
+  head_pan:
+    board: board_1
+    channel: 2
+    model: DS3109MG   # verify exact torque/current variant before load (§2.5)
+    min_angle_deg: 10.0
+    max_angle_deg: 170.0
+    center_angle_deg: 90.0
+    reverse: false
+    pwm_min_us: 500
+    pwm_max_us: 2500
+    max_speed_deg_s: 90.0
+
+safety:
+  command_timeout_s: 0.5   # → HOLD/SAFE on timeout (§12)
+  startup_require_enable: true
+  initial_position_slow: true

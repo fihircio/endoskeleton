@@ -1,0 +1,14 @@
+services:
+  humanoid-dev:
+    build: .
+    image: humanoid-v1:humble
+    volumes:
+      - ./ros2_ws:/ws/ros2_ws
+      - ./config:/ws/config
+    network_mode: host
+    privileged: false
+    stdin_open: true
+    tty: true
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
