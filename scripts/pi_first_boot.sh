@@ -12,13 +12,15 @@ sudo apt-get update && sudo apt-get full-upgrade -y
 
 echo "== 2. base tools =="
 sudo apt-get install -y --no-install-recommends \
-  git vim i2c-tools python3-pip python3-venv \
+  git vim i2c-tools python3-pip python3-venv python3-dev \
   libcamera-apps rpicam-apps 2>/dev/null || \
 sudo apt-get install -y --no-install-recommends \
-  git vim i2c-tools python3-pip python3-venv libcamera-apps
+  git vim i2c-tools python3-pip python3-venv python3-dev libcamera-apps
 
 echo "== 3. hostname -> humanoid-pi1 (spec section 4: .11) =="
 sudo hostnamectl set-hostname humanoid-pi1 || true
+# keep sudo warning-free: hostnamectl does not rewrite the 127.0.1.1 line
+sudo sed -i 's/127.0.1.1.*/127.0.1.1\thumanoid-pi1/' /etc/hosts || true
 
 echo "== 4. I2C + SPI + camera (needs reboot to take effect) =="
 sudo raspi-config nonint do_i2c 0
