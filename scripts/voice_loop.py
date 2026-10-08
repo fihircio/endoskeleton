@@ -62,19 +62,38 @@ def blip(freq=880, ms=120):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+_ARECORD = None  # current recorder, so signals never orphan it
+
+
 def listen():
     """Record one window, return mono int16 bytes (downmixed)."""
-    p = subprocess.run(
+    global _ARECORD
+    _ARECORD = subprocess.Popen(
         ["arecord", "-q", "-D", MIC, "-f", "S16_LE", "-r", str(RATE),
          "-c", "2", "-d", str(LISTEN_S), "-t", "raw"],
-        capture_output=True)
-    raw = p.stdout
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        raw, _ = _ARECORD.communicate(timeout=LISTEN_S + 10)
+    except subprocess.TimeoutExpired:
+        _ARECORD.kill()
+        raw, _ = _ARECORD.communicate()
+    finally:
+        _ARECORD = None
     n = len(raw) // 2
     if n == 0:
         return b""
     stereo = struct.unpack(f"<{n}h", raw[:n * 2])
     mono = [(a + b) // 2 for a, b in zip(stereo[0::2], stereo[1::2])]
     return struct.pack(f"<{len(mono)}h", *mono)
+
+
+def _cleanup(signum=None, frame=None):
+    if _ARECORD is not None:
+        try:
+            _ARECORD.kill()
+        except OSError:
+            pass
+    raise SystemExit(0)
 
 
 def stt(pcm):
@@ -107,7 +126,7 @@ def ask_llm(user_text):
 
 
 def speak(text):
-    p1 = subprocess.Popen(["espeak-ng", "--stdout", "-s", "170", "-v", "en", text],
+    p1 = subprocess.Popen(["espeak-ng", "--stdout", "-s", "135", "-v", "en", text],
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     subprocess.run(["aplay", "-q", "-D", SPK], stdin=p1.stdout,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -132,17 +151,33 @@ def main():
         return
     set_mood("normal")
     log("EMO", "voice loop online. Speak after the blip.")
+    import math as _math
+    import signal as _signal
+    # clear any recorder orphaned by a previous killed loop
+    subprocess.run(["pkill", "-f", "arecord.*hw:3"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _signal.signal(_signal.SIGTERM, _cleanup)
     while True:
         try:
             blip()
             pcm = listen()
-            text = stt(pcm) if pcm else ""
-            if not text:
+            n = len(pcm) // 2
+            if n == 0:
+                log("EMO", "mic gave no bytes.")
                 continue
+            samp = struct.unpack(f"<{n}h", pcm)
+            rms = _math.sqrt(sum(s * s for s in samp) / n)
+            peak = max(abs(s) for s in samp)
+            text = stt(pcm)
+            if not text:
+                log("EMO", f"heard nothing (rms={rms:.0f} peak={peak}).")
+                continue
+            log("EMO", f"mic level rms={rms:.0f} peak={peak}.")
             round_trip(text)
         except KeyboardInterrupt:
             log("EMO", "going to sleep.")
             set_mood("sleep")
+            _cleanup()
             break
 
 
