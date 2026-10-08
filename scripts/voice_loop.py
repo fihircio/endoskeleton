@@ -50,6 +50,15 @@ def log(who, text):
         pass
 
 
+def _play_wav(path, device=SPK):
+    """Play through a file lock: concurrent speakers (loop blips vs polls
+    vs --once tests) queue instead of colliding on the USB device."""
+    subprocess.run(["flock", "/tmp/elberr-audio.lock",
+                    "aplay", "-q", "-D", device, path],
+                   check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
+
+
 def blip(freq=880, ms=120):
     tone = os.path.join("/tmp", "blip.wav")
     subprocess.run(
@@ -58,8 +67,10 @@ def blip(freq=880, ms=120):
          "w.setnchannels(1);w.setsampwidth(2);w.setframerate(16000);"
          f"w.writeframes(b''.join(struct.pack('<h',int(9000*math.sin(2*math.pi*{freq}*i/16000))) for i in range(int(16000*{ms}/1000))))"],
         check=True)
-    subprocess.run(["aplay", "-q", "-D", SPK, tone],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _play_wav(tone)
+    except Exception:
+        pass
 
 
 _ARECORD = None  # current recorder, so signals never orphan it
@@ -241,9 +252,7 @@ def _speak_piper(text):
                     "pitch", "-300"],
                    check=True, stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL)
-    subprocess.run(["aplay", "-q", "-D", SPK, "/tmp/elberr-robot.wav"],
-                   check=True, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL)
+    _play_wav("/tmp/elberr-robot.wav")
 
 
 def speak(text):
@@ -252,10 +261,10 @@ def speak(text):
         return
     except Exception as e:
         log("ELBERR", f"piper failed ({e}), espeak fallback.")
-        p1 = subprocess.Popen(["espeak-ng", "--stdout", "-s", "135", "-v", "en", text],
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        subprocess.run(["aplay", "-q", "-D", SPK], stdin=p1.stdout,
+        subprocess.run(["espeak-ng", "-w", "/tmp/elberr-espeak.wav",
+                        "-s", "135", "-v", "en", text],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _play_wav("/tmp/elberr-espeak.wav")
 
 
 def round_trip(user_text):
@@ -450,8 +459,9 @@ def handle_command(text):
         return True
     if any(k in t for k in ("help", "what can you do")):
         set_mood("happy")
-        help_text = ("Try: take a photo. Status. What time is it. What is the "
-                     "weather. Go to sleep. Wake up. Or just talk to me.")
+        help_text = ("Try: take a photo. Look happy, surprised, angry, tired, "
+                     "curious, or sleepy. Laugh. Look confused. Status. "
+                     "What time is it. Go to sleep. Wake up. Or just talk.")
         log("ELBERR", help_text)
         speak(help_text)
         set_mood("normal")
@@ -476,8 +486,26 @@ def handle_command(text):
         speak(ans)
         set_mood("normal")
         return True
+    for mood, keys, line in [
+        ("happy", ("look happy", "be happy", "smile", "seem happy"), "Yay!"),
+        ("surprised", ("look surprised", "be surprised", "surprise me"), "Whoa!"),
+        ("angry", ("look angry", "be angry", "act angry", "get angry"), "Grr."),
+        ("tired", ("look tired", "be tired", "act tired"), "So sleepy."),
+        ("curious", ("look curious", "be curious", "act curious"), "Hmm?"),
+        ("sleepy", ("look sleepy", "be sleepy"), "Eyes heavy."),
+        ("normal", ("look normal", "neutral face", "normal face", "calm down"), "Okay."),
+        ("laugh", ("make me laugh", "be funny", "tell me a joke"), "Ha ha ha!"),
+        ("confused", ("confused", "look confused", "are you confused"), "Huh?"),
+    ]:
+        if any(k in t for k in keys):
+            set_mood(mood)
+            log("ELBERR", f"mood -> {mood}")
+            speak(line)
+            set_mood("normal")
+            return True
     if any(k in t for k in ("what do you see", "describe", "look at me",
                             "do you see me", "who is there", "who is it")):
+        path = None
         try:
             path = _take_photo()
             desc = _describe_scene(path)
@@ -485,8 +513,9 @@ def handle_command(text):
             desc = "My eyes did not cooperate."
             log("ELBERR", f"describe failed: {e}")
         log("ELBERR", desc)
-        open("/tmp/face_photo", "w").write(path + "\n")
-        set_mood("photo")
+        if path is not None:
+            open("/tmp/face_photo", "w").write(path + "\n")
+            set_mood("photo")
         speak(desc)
         time.sleep(2.0)
         try:
