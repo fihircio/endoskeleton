@@ -156,6 +156,9 @@ def main():
                     choices=["normal", "happy", "sleepy", "surprised", "sleep"])
     ap.add_argument("--demo", action="store_true", help="cycle moods every 6s")
     ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--mood-file", default=None,
+                    help="when present and fresh, mood is read from this file "
+                         "(written by voice_loop); e.g. /tmp/face_mood")
     args = ap.parse_args()
 
     pygame.init()
@@ -164,6 +167,7 @@ def main():
     pygame.mouse.set_visible(False)
     face = Face(screen)
     face.mood = args.mood
+    mood_file, mood_mtime = args.mood_file, 0
     moods = ["normal", "happy", "sleepy", "surprised", "normal", "sleep"]
     mi, next_switch = 0, time.time() + 6
     clock = pygame.time.Clock()
@@ -184,6 +188,17 @@ def main():
                 mi = (mi + 1) % len(moods)
                 face.mood = moods[mi]
                 next_switch = now + 6
+            if mood_file:
+                try:
+                    mt = os.path.getmtime(mood_file)
+                    if mt != mood_mtime:
+                        mood_mtime = mt
+                        m = open(mood_file).read().strip().split()[0]
+                        if m in ("normal", "happy", "sleepy", "surprised", "sleep"):
+                            face.mood = m
+                            next_switch = now + 6  # pause demo rotation
+                except OSError:
+                    pass
             face.update(min(0.05, now - last), now)
             last = now
             face.draw()
