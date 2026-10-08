@@ -205,11 +205,46 @@ def ask_llm(user_text):
     return " ".join(reply.split())[:280] or "Hmm."
 
 
+def _speak_piper(text):
+    """Neural voice via local wyoming-piper server (needs :10200 up)."""
+    import asyncio as _aio
+    from wyoming.audio import AudioChunk as _AC, AudioStop as _AS
+    from wyoming.client import AsyncTcpClient as _Client
+    from wyoming.tts import Synthesize as _Syn
+
+    async def _run():
+        audio = bytearray()
+        async with _Client("127.0.0.1", 10200) as client:
+            await client.write_event(_Syn(text=text).event())
+            while True:
+                event = await client.read_event()
+                if event is None:
+                    break
+                if _AC.is_type(event.type):
+                    audio += _AC.from_event(event).audio
+                elif _AS.is_type(event.type):
+                    break
+        return bytes(audio)
+
+    return _aio.run(_run())
+
+
 def speak(text):
-    p1 = subprocess.Popen(["espeak-ng", "--stdout", "-s", "135", "-v", "en", text],
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    subprocess.run(["aplay", "-q", "-D", SPK], stdin=p1.stdout,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        audio = _speak_piper(text)  # 22050 Hz mono S16
+        p = subprocess.run(["aplay", "-q", "-D", SPK, "-f", "S16_LE",
+                            "-r", "22050", "-c", "1"],
+                           input=audio, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=60)
+        if p.returncode == 0 and audio:
+            return
+        raise RuntimeError("piper empty/failed")
+    except Exception as e:
+        log("EMO", f"piper failed ({e}), espeak fallback.")
+        p1 = subprocess.Popen(["espeak-ng", "--stdout", "-s", "135", "-v", "en", text],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        subprocess.run(["aplay", "-q", "-D", SPK], stdin=p1.stdout,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def round_trip(user_text):
