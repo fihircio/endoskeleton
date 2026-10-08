@@ -69,14 +69,14 @@ class Face:
                 self.blinking = False
         else:
             self.open_target = 1.0
-            if now > self.next_blink and self.mood in ("normal", "surprised"):
+            if now > self.next_blink and self.mood in ("normal", "surprised", "listening"):
                 self.blinking = True
                 self.next_blink = now + random.uniform(2.2, 5.0)
         # eyelid servo: fast shut, softer open
         rate = 14.0 if self.open_target < self.open else 7.0
         self.open += clamp(self.open_target - self.open, -rate * dt, rate * dt)
 
-        if now > self.next_saccade and self.mood in ("normal", "happy", "sleepy"):
+        if now > self.next_saccade and self.mood in ("normal", "happy", "sleepy", "listening"):
             self.look_target = [random.uniform(-1, 1), random.uniform(-0.7, 0.7)]
             self.next_saccade = now + random.uniform(1.4, 3.8)
         k = min(1.0, dt * 6.0)
@@ -96,7 +96,11 @@ class Face:
             rect = pygame.Rect(cx - w / 2, cy - h / 2 + 18, w, h)
             pygame.draw.arc(self.screen, EYE, rect, math.pi * 0.15, math.pi * 0.85, 22)
             return
-        if self.mood == "surprised":
+        if self.mood == "listening":
+            # wide alert eyes with a gentle pulse
+            pulse = 1.0 + 0.05 * math.sin(time.time() * 5.0)
+            w, h = (EYE_W + 20) * pulse, (EYE_H + 34) * pulse
+        elif self.mood == "surprised":
             w, h = EYE_W + 26, EYE_H + 40
         elif self.mood == "sleepy":
             w, h = EYE_W + 6, EYE_H
@@ -153,7 +157,7 @@ def _present(surf):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mood", default="normal",
-                    choices=["normal", "happy", "sleepy", "surprised", "sleep"])
+                    choices=["normal", "happy", "sleepy", "surprised", "sleep", "listening"])
     ap.add_argument("--demo", action="store_true", help="cycle moods every 6s")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--mood-file", default=None,
@@ -168,7 +172,7 @@ def main():
     face = Face(screen)
     face.mood = args.mood
     mood_file, mood_mtime = args.mood_file, 0
-    moods = ["normal", "happy", "sleepy", "surprised", "normal", "sleep"]
+    moods = ["normal", "listening", "happy", "sleepy", "surprised", "normal", "sleep"]
     mi, next_switch = 0, time.time() + 6
     clock = pygame.time.Clock()
     last = time.time()
@@ -181,7 +185,7 @@ def main():
                 if e.type == pygame.KEYDOWN:
                     if e.key == pygame.K_ESCAPE:
                         return
-                    for i, m in enumerate(["normal", "happy", "sleepy", "surprised", "sleep"]):
+                    for i, m in enumerate(["normal", "happy", "sleepy", "surprised", "sleep", "listening"]):
                         if e.key == getattr(pygame, f"K_{i + 1}"):
                             face.mood = m
             if args.demo and now > next_switch:
@@ -194,7 +198,7 @@ def main():
                     if mt != mood_mtime:
                         mood_mtime = mt
                         m = open(mood_file).read().strip().split()[0]
-                        if m in ("normal", "happy", "sleepy", "surprised", "sleep"):
+                        if m in ("normal", "happy", "sleepy", "surprised", "sleep", "listening"):
                             face.mood = m
                             next_switch = now + 6  # pause demo rotation
                 except OSError:

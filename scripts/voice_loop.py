@@ -214,11 +214,12 @@ def speak(text):
 
 def round_trip(user_text):
     log("YOU", user_text)
-    set_mood("happy")
+    set_mood("sleepy")  # small thinking eyes
     reply = ask_llm(user_text)
     log("EMO", reply)
+    set_mood("happy")   # ^ ^ while speaking
     speak(reply)
-    set_mood("normal")
+    set_mood("normal")  # big idle eyes
     return reply
 
 
@@ -233,12 +234,15 @@ def main():
     log("EMO", "voice loop online. Speak after the blip.")
     import math as _math
     import signal as _signal
-    # clear any recorder orphaned by a previous killed loop
-    subprocess.run(["pkill", "-f", "arecord.*hw:3"],
+    # clear any recorder orphaned by a previous killed loop (-x matches
+    # the process name only, so it can never match our own shell)
+    subprocess.run(["pkill", "-x", "arecord"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _signal.signal(_signal.SIGTERM, _cleanup)
+    last_speech, sleeping = time.time(), False
     while True:
         try:
+            set_mood("sleep" if sleeping else "listening")
             blip()
             pcm = listen()
             n = len(pcm) // 2
@@ -251,7 +255,11 @@ def main():
             text = stt(pcm)
             if not text:
                 log("EMO", f"heard nothing (rms={rms:.0f} peak={peak}).")
+                if not sleeping and time.time() - last_speech > 300:
+                    sleeping = True
+                    log("EMO", "quiet for 5 min -> sleep.")
                 continue
+            last_speech, sleeping = time.time(), False
             log("EMO", f"mic level rms={rms:.0f} peak={peak}.")
             round_trip(text)
         except KeyboardInterrupt:
