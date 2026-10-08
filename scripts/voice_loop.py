@@ -108,23 +108,49 @@ def _read_exact(proc, nbytes, timeout_s=LISTEN_S + 8):
     return bytes(out)
 
 
+def _rms(samples):
+    import math as _math
+    return _math.sqrt(sum(s * s for s in samples) / max(len(samples), 1))
+
+
 def listen():
-    """Read one LISTEN_S window from the persistent mic stream."""
-    want = RATE * LISTEN_S * 2 * 2  # rate * s * ch * bytes
-    for attempt in ("stream", "reopen"):
+    """VAD-gated window from the persistent mic stream.
+
+    Records until 0.8s of trailing silence after speech (or 6s of
+    silence / 8s total cap), so typical turns take ~2s, not 6s.
+    """
+    for _ in ("stream", "reopen"):
         proc = _STREAM or _open_stream()
         if proc.poll() is not None:  # died -> reopen once
             proc = _open_stream()
-        raw = _read_exact(proc, want)
-        if len(raw) >= want // 2:  # got usable audio
+        chunk_bytes = RATE * 2 * 2 // 5  # 0.2s stereo S16
+        buf, speech, quiet, elapsed = bytearray(), False, 0, 0.0
+        while elapsed < 8.0:
+            raw = _read_exact(proc, chunk_bytes, timeout_s=3.0)
+            if len(raw) < chunk_bytes // 2:
+                break  # stream dead; outer retry reopens
+            buf += raw
+            elapsed += 0.2
+            n = len(raw) // 2
+            mono = struct.unpack(f"<{n}h", raw[:n * 2])[0::2]
+            level = _rms(mono)
+            if not speech:
+                if level > 1500:
+                    speech = True
+                    quiet = 0
+                elif elapsed >= 6.0:
+                    break  # nobody home
+            else:
+                quiet = quiet + 1 if level < 700 else 0
+                if quiet >= 4 and elapsed >= 1.0:
+                    break  # 0.8s trailing silence
+        if len(buf) >= RATE * 2 * 2 // 2:  # >=0.5s audio
             break
         _close_stream()  # wedge suspected: fresh handle, one retry
     else:
         return b""
-    n = len(raw) // 2
-    if n == 0:
-        return b""
-    stereo = struct.unpack(f"<{n}h", raw[:n * 2])
+    n = len(buf) // 2
+    stereo = struct.unpack(f"<{n}h", bytes(buf[:n * 2]))
     mono = [(a + b) // 2 for a, b in zip(stereo[0::2], stereo[1::2])]
     return struct.pack(f"<{len(mono)}h", *mono)
 
@@ -149,22 +175,33 @@ def stt(pcm):
 
 
 def ask_llm(user_text):
-    prompt = ("<|im_start|>system\nYou are Emo, a tiny cute desk robot Hand-built "
-              "by your human on a Raspberry Pi. You see through a small camera "
-              "and show your feelings with big cyan eyes. Keep every reply to "
-              "one short plain sentence, no lists, no quotes.<|im_end|>\n"
-              f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n")
-    p = subprocess.run(
-        [LLAMA, "cli", "-m", MODEL, "-p", prompt, "-n", "30",
-         "--temp", "0.7", "--no-display-prompt"],
-        capture_output=True, text=True, timeout=180)
-    out = (p.stdout or "").strip().splitlines()
-    # strip prompt echo + chat template artifacts, keep the reply proper
-    lines = [ln for ln in out
-             if ln.strip() and "im_start" not in ln and "im_end" not in ln
-             and ln.strip() != user_text.strip()]
-    reply = (lines[-1] if lines else "Hmm.").strip()
-    reply = reply.split("assistant")[-1].strip(" :")
+    """Chat via local llama-server (needs: llama serve -m MODEL --port 8080).
+
+    Server keeps the model resident, so turns take ~3s instead of ~20s.
+    """
+    import json as _json
+    import urllib.request as _url
+    body = _json.dumps({
+        "messages": [
+            {"role": "system",
+             "content": "You are Emo, a tiny cute desk robot hand-built by your "
+                        "human on a Raspberry Pi. One short plain sentence, no lists."},
+            {"role": "user", "content": user_text},
+        ],
+        "max_tokens": 25,
+        "temperature": 0.7,
+    }).encode()
+    try:
+        req = _url.Request("http://localhost:8080/v1/chat/completions",
+                           data=body, headers={"Content-Type": "application/json"})
+        with _url.urlopen(req, timeout=120) as r:
+            choices = _json.load(r)["choices"]
+    except Exception as e:  # server down? log and stay charming
+        log("EMO", f"brain unreachable: {e}")
+        return "Hmm."
+    if not choices:
+        return "Hmm."
+    reply = choices[0]["message"]["content"]
     return " ".join(reply.split())[:280] or "Hmm."
 
 
