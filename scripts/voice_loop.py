@@ -269,12 +269,79 @@ def round_trip(user_text):
     return reply
 
 
+# --- structured commands: deterministic intents the tiny LLM must never
+# improvise (spec section 47: the control layer owns the vocabulary, the
+# model only chats). Keyword fast-path; everything else falls to chat. ---
+PHOTOS = os.path.join(BRAIN, "photos")
+
+
+def _sys_status():
+    import re as _re
+    up = subprocess.run(["uptime", "-p"], capture_output=True,
+                        text=True).stdout.strip().replace("up ", "")
+    t = subprocess.run(["vcgencmd", "measure_temp"], capture_output=True,
+                       text=True).stdout.strip().replace("temp=", "")
+    mem = subprocess.run(["free", "-m"], capture_output=True,
+                         text=True).stdout.splitlines()[1].split()
+    pct = int(mem[2]) * 100 // int(mem[1])
+    return f"I am fine. Up {up}, {t}, memory {pct} percent full."
+
+
+def _take_photo():
+    os.makedirs(PHOTOS, exist_ok=True)
+    path = os.path.join(PHOTOS, time.strftime("IMG_%Y%m%d_%H%M%S.jpg"))
+    subprocess.run(["fswebcam", "-q", "-d", "/dev/video0", "-r", "1280x720",
+                    "--no-banner", "--jpeg", "85", "-F", "5", path],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=60)
+    return path
+
+
+def handle_command(text):
+    """Returns True if text was a command (already executed)."""
+    t = text.lower()
+    if any(k in t for k in ("take a photo", "take a picture", "selfie", "cheese")):
+        set_mood("happy")
+        try:
+            path = _take_photo()
+            log("ELBERR", f"photo saved {path}")
+            speak("Cheese! Saved it.")
+        except Exception as e:
+            log("ELBERR", f"camera failed: {e}")
+            speak("My camera did not cooperate.")
+        set_mood("normal")
+        return True
+    if any(k in t for k in ("go to sleep", "sleep now", "good night")):
+        speak("Sleeping now.")
+        return "sleep"
+    if any(k in t for k in ("wake up", "wake up elberr")):
+        speak("I am awake.")
+        return "wake"
+    if any(k in t for k in ("status", "how are you", "system status")):
+        set_mood("happy")
+        status = _sys_status()
+        log("ELBERR", status)
+        speak(status)
+        set_mood("normal")
+        return True
+    if any(k in t for k in ("help", "what can you do")):
+        set_mood("happy")
+        help_text = ("Try: take a photo. Status. Go to sleep. Wake up. "
+                     "Or just talk to me.")
+        log("ELBERR", help_text)
+        speak(help_text)
+        set_mood("normal")
+        return True
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", default=None, help="text-only round trip, no mic")
     args = ap.parse_args()
     if args.once:
-        round_trip(args.once)
+        if handle_command(args.once) is False:
+            round_trip(args.once)
         return
     set_mood("normal")
     log("ELBERR", "voice loop online. Speak after the blip.")
@@ -286,28 +353,49 @@ def main():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _signal.signal(_signal.SIGTERM, _cleanup)
     last_speech, sleeping = time.time(), False
+    dead_streak = 0
     while True:
         try:
             set_mood("sleep" if sleeping else "listening")
+            if dead_streak >= 3:
+                # mic wedged (this camera allows ~1 open per USB enumeration):
+                # back off instead of blipping constantly; a hub reset + fresh
+                # loop is the recovery (see docs).
+                log("ELBERR", "mic dead, backing off 60s.")
+                set_mood("sleep")
+                time.sleep(60)
+                dead_streak = 0
+                continue
             blip()
             pcm = listen()
             n = len(pcm) // 2
             if n == 0:
+                dead_streak += 1
                 log("ELBERR", "mic gave no bytes.")
                 continue
             samp = struct.unpack(f"<{n}h", pcm)
             rms = _math.sqrt(sum(s * s for s in samp) / n)
             peak = max(abs(s) for s in samp)
             text = stt(pcm)
+            dead_streak = 0  # mic delivered audio; only speech was absent
             if not text:
                 log("ELBERR", f"heard nothing (rms={rms:.0f} peak={peak}).")
                 if not sleeping and time.time() - last_speech > 300:
                     sleeping = True
                     log("ELBERR", "quiet for 5 min -> sleep.")
                 continue
-            last_speech, sleeping = time.time(), False
+            if sleeping:
+                sleeping = False
+                log("ELBERR", "woke up.")
+            last_speech = time.time()
+            dead_streak = 0
             log("ELBERR", f"mic level rms={rms:.0f} peak={peak}.")
-            round_trip(text)
+            cmd = handle_command(text)
+            if cmd == "sleep":
+                sleeping = True
+            elif cmd != "wake":
+                if not cmd:
+                    round_trip(text)
         except KeyboardInterrupt:
             log("ELBERR", "going to sleep.")
             set_mood("sleep")
