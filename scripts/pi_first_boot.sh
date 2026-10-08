@@ -13,9 +13,16 @@ sudo apt-get update && sudo apt-get full-upgrade -y
 echo "== 2. base tools =="
 sudo apt-get install -y --no-install-recommends \
   git vim i2c-tools python3-pip python3-venv python3-dev \
-  libcamera-apps rpicam-apps 2>/dev/null || \
+  libcamera-apps rpicam-apps alsa-utils fswebcam 2>/dev/null || \
 sudo apt-get install -y --no-install-recommends \
-  git vim i2c-tools python3-pip python3-venv python3-dev libcamera-apps
+  git vim i2c-tools python3-pip python3-venv python3-dev libcamera-apps \
+  alsa-utils fswebcam
+# Cheap USB-audio gadgets wedge when the kernel auto-suspends their ports.
+# Keep USB audio devices awake (prevents "cannot get freq" mic death).
+sudo tee /etc/udev/rules.d/99-usb-audio.rules >/dev/null <<'EOF'
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{power/control}=="*", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="8087", ATTR{power/control}=="*", ATTR{power/control}="on"
+EOF
 
 echo "== 3. hostname -> humanoid-pi1 (spec section 4: .11) =="
 sudo hostnamectl set-hostname humanoid-pi1 || true
