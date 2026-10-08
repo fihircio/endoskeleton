@@ -272,6 +272,13 @@ def round_trip(user_text):
 # --- structured commands: deterministic intents the tiny LLM must never
 # improvise (spec section 47: the control layer owns the vocabulary, the
 # model only chats). Keyword fast-path; everything else falls to chat. ---
+
+# --- place this robot lives (set on first run; ask the human) ---
+# Used for local time (via system timezone) and Open-Meteo weather.
+# Kuala Lumpur default; correct me and I'll move it.
+PLACE_NAME = "Kuala Lumpur"
+PLACE_LAT, PLACE_LON = 3.1390, 101.6869
+PLACE_TZ = "Asia/Kuala_Lumpur"
 PHOTOS = os.path.join(BRAIN, "photos")
 
 
@@ -297,6 +304,42 @@ def _take_photo():
     return path
 
 
+def _say_datetime():
+    import datetime as _dt
+    now = _dt.datetime.now()
+    day = now.day
+    suf = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return now.strftime(f"%A, %B {day}{suf}, %I:%M %p").replace(" 0", " ")
+
+
+_WMO = [(0, "clear sky"), (1, "mostly clear"), (2, "partly cloudy"),
+        (3, "overcast"), (45, "foggy"), (48, "foggy"), (51, "light drizzle"),
+        (53, "drizzle"), (55, "heavy drizzle"), (61, "light rain"),
+        (63, "rain"), (65, "heavy rain"), (71, "light snow"),
+        (73, "snow"), (75, "heavy snow"), (80, "light showers"),
+        (81, "showers"), (82, "heavy showers"), (95, "thunderstorms")]
+
+
+def _wmo_word(code):
+    best = "unsettled"
+    for c, w in sorted(_WMO):
+        if code >= c:
+            best = w
+    return best
+
+
+def _say_weather():
+    import json as _json
+    import urllib.request as _url
+    q = (f"https://api.open-meteo.com/v1/forecast?latitude={PLACE_LAT}"
+         f"&longitude={PLACE_LON}&current=temperature_2m,weather_code")
+    with _url.urlopen(q, timeout=20) as r:
+        cur = _json.load(r)["current"]
+    temp = round(cur["temperature_2m"])
+    cond = _wmo_word(int(cur["weather_code"]))
+    return f"In {PLACE_NAME} it is {temp} degrees and {cond}."
+
+
 def handle_command(text):
     """Returns True if text was a command (already executed)."""
     t = text.lower()
@@ -308,7 +351,7 @@ def handle_command(text):
             open("/tmp/face_photo", "w").write(path + "\n")  # face shows it...
             set_mood("photo")
             speak("Cheese! Saved it.")  # ...while this plays (~4s)
-            time.sleep(1.0)
+            time.sleep(2.5)  # ...plus a beat, ~7s total
         except Exception as e:
             log("ELBERR", f"camera failed: {e}")
             speak("My camera did not cooperate.")
@@ -334,10 +377,30 @@ def handle_command(text):
         return True
     if any(k in t for k in ("help", "what can you do")):
         set_mood("happy")
-        help_text = ("Try: take a photo. Status. Go to sleep. Wake up. "
-                     "Or just talk to me.")
+        help_text = ("Try: take a photo. Status. What time is it. What is the "
+                     "weather. Go to sleep. Wake up. Or just talk to me.")
         log("ELBERR", help_text)
         speak(help_text)
+        set_mood("normal")
+        return True
+    if any(k in t for k in ("what time", "the time", "what date", "today's date",
+                            "what day is", "day is it")):
+        set_mood("happy")
+        ans = "It is " + _say_datetime() + "."
+        log("ELBERR", ans)
+        speak(ans)
+        set_mood("normal")
+        return True
+    if any(k in t for k in ("weather", "temperature outside", "is it raining",
+                            "is it hot", "is it cold")):
+        set_mood("happy")
+        try:
+            ans = _say_weather()
+        except Exception as e:
+            ans = "I could not reach the weather service."
+            log("ELBERR", f"weather failed: {e}")
+        log("ELBERR", ans)
+        speak(ans)
         set_mood("normal")
         return True
     return False

@@ -225,21 +225,24 @@ def main():
                     for i, m in enumerate(["normal", "happy", "sleepy", "surprised", "sleep", "listening"]):
                         if e.key == getattr(pygame, f"K_{i + 1}"):
                             face.mood = m
-            if args.demo and now > next_switch:
-                mi = (mi + 1) % len(moods)
-                face.mood = moods[mi]
-                next_switch = now + 6
+            ext_fresh = False
             if mood_file:
                 try:
                     mt = os.path.getmtime(mood_file)
+                    # fresh external control pauses demo rotation so it can't
+                    # stomp photo/listening faces mid-display
+                    ext_fresh = (now - mt) < 30
                     if mt != mood_mtime:
                         mood_mtime = mt
                         m = open(mood_file).read().strip().split()[0]
                         if m in ("normal", "happy", "sleepy", "surprised", "sleep", "listening", "photo"):
                             face.mood = m
-                            next_switch = now + 6  # pause demo rotation
                 except OSError:
                     pass
+            if args.demo and not ext_fresh and now > next_switch:
+                mi = (mi + 1) % len(moods)
+                face.mood = moods[mi]
+                next_switch = now + 6
             face.update(min(0.05, now - last), now)
             last = now
             face.draw()
