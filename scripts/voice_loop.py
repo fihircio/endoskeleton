@@ -505,17 +505,27 @@ def main():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _signal.signal(_signal.SIGTERM, _cleanup)
     last_speech, sleeping = time.time(), False
-    dead_streak = 0
+    dead_streak, last_reset = 0, 0.0
     while True:
         try:
             set_mood("sleep" if sleeping else "listening")
             if dead_streak >= 3:
-                # mic wedged (this camera allows ~1 open per USB enumeration):
-                # back off instead of blipping constantly; a hub reset + fresh
-                # loop is the recovery (see docs).
-                log("ELBERR", "mic dead, backing off 60s.")
-                set_mood("sleep")
-                time.sleep(60)
+                # Mic wedged. This camera's endpoint only recovers via USB
+                # re-enumeration; heal it ourselves (max once per 5 min),
+                # else back off quietly instead of blipping constantly.
+                if time.time() - last_reset > 300:
+                    last_reset = time.time()
+                    log("ELBERR", "mic dead, resetting USB audio.")
+                    subprocess.run(
+                        ["sudo", "-n", "/usr/local/bin/usb-audio-reset"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=60)
+                    time.sleep(10)  # re-enumerate
+                    set_mood("listening")
+                else:
+                    log("ELBERR", "mic dead, backing off 60s.")
+                    set_mood("sleep")
+                    time.sleep(60)
                 dead_streak = 0
                 continue
             blip()
