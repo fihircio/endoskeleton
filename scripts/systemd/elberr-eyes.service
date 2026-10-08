@@ -1,0 +1,15 @@
+[Unit]
+Description=Elberr face screen (EMO eyes on SPI LCD)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Environment=SDL_FBDEV=/dev/fb0
+ExecStart=/usr/bin/python3 /home/pi/emo_eyes.py --demo --mood-file /tmp/face_mood
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

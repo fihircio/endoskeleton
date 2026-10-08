@@ -1,0 +1,15 @@
+[Unit]
+Description=Elberr TTS server (wyoming-piper lessac)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/brain
+ExecStart=/usr/bin/python3 -m wyoming_piper --uri tcp://127.0.0.1:10200 --data-dir /home/pi/brain/voices --voice en_US-lessac-medium
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

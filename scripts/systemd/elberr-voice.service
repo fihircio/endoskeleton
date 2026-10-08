@@ -1,0 +1,17 @@
+[Unit]
+Description=Elberr voice loop (mic -> Vosk -> LLM -> speaker)
+After=network-online.target elberr-llm.service elberr-tts.service
+Wants=network-online.target
+Requires=elberr-llm.service elberr-tts.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/brain
+ExecStartPre=/bin/sleep 25
+ExecStart=/usr/bin/python3 /home/pi/voice_loop.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

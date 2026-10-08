@@ -1,0 +1,14 @@
+[Unit]
+Description=Elberr LLM server (llama.cpp Qwen2.5-0.5B)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+ExecStart=/home/pi/.llama-app/llama serve -m /home/pi/brain/models/qwen25-05b-q4km.gguf --port 8080 --ctx-size 1024
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
