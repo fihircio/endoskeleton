@@ -340,6 +340,68 @@ def _say_weather():
     return f"In {PLACE_NAME} it is {temp} degrees and {cond}."
 
 
+def _color_name(b, g, r):
+    import cv2 as _cv2
+    import numpy as _np
+    h, s, v = _cv2.cvtColor(
+        _np.uint8([[[b, g, r]]]), _cv2.COLOR_BGR2HSV)[0][0].tolist()
+    if v < 50:
+        return "black"
+    if s < 40:
+        return "white" if v > 180 else "gray"
+    if h < 10 or h >= 160:
+        return "red"
+    if h < 25:
+        return "orange"
+    if h < 35:
+        return "yellow"
+    if h < 85:
+        return "green"
+    if h < 130:
+        return "blue"
+    return "purple"
+
+
+def _describe_scene(path):
+    """Classical CV only (1GB Pi can't host a VLM): faces, light, colors."""
+    import cv2 as _cv2
+    img = _cv2.imread(path)
+    if img is None:
+        raise RuntimeError("unreadable photo")
+    small = _cv2.resize(img, (320, 240))
+    gray = _cv2.cvtColor(small, _cv2.COLOR_BGR2GRAY)
+    nfaces = 0
+    try:
+        det = _cv2.FaceDetectorYN.create(
+            os.path.join(BRAIN, "models", "yunet_2023mar.onnx"), "",
+            (320, 240), score_threshold=0.6)
+        _, faces = det.detect(small)
+        nfaces = 0 if faces is None else len(faces)
+    except Exception:
+        nfaces = 0
+    mean = float(gray.mean())
+    light = "dark" if mean < 60 else ("dim" if mean < 120 else "bright")
+    tiny = _cv2.resize(img, (32, 32)).reshape(-1, 3).astype("float32")
+    _, _, centers = _cv2.kmeans(
+        tiny, 3, None,
+        (_cv2.TERM_CRITERIA_EPS + _cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0),
+        2, _cv2.KMEANS_PP_CENTERS)
+    names = []
+    for b, g, r in centers.astype(int).tolist():
+        name = _color_name(b, g, r)
+        if name not in names:
+            names.append(name)
+    while len(names) < 2:  # dark rooms have one color: pad it
+        names.append(names[0])
+    if nfaces == 1:
+        who = "I see you! "
+    elif nfaces > 1:
+        who = f"I see {nfaces} faces. "
+    else:
+        who = "I see no faces. "
+    return f"{who}The room is {light}, mostly {names[0]} and {names[1]}."
+
+
 def handle_command(text):
     """Returns True if text was a command (already executed)."""
     t = text.lower()
@@ -401,6 +463,25 @@ def handle_command(text):
             log("ELBERR", f"weather failed: {e}")
         log("ELBERR", ans)
         speak(ans)
+        set_mood("normal")
+        return True
+    if any(k in t for k in ("what do you see", "describe", "look at me",
+                            "do you see me", "who is there", "who is it")):
+        try:
+            path = _take_photo()
+            desc = _describe_scene(path)
+        except Exception as e:
+            desc = "My eyes did not cooperate."
+            log("ELBERR", f"describe failed: {e}")
+        log("ELBERR", desc)
+        open("/tmp/face_photo", "w").write(path + "\n")
+        set_mood("photo")
+        speak(desc)
+        time.sleep(2.0)
+        try:
+            os.remove("/tmp/face_photo")
+        except OSError:
+            pass
         set_mood("normal")
         return True
     return False
