@@ -28,8 +28,8 @@ LLAMA = os.path.join(HOME, ".llama-app", "llama")
 MOOD_FILE = "/tmp/face_mood"
 LOG = os.path.join(BRAIN, "chats.log")
 
-MIC = "hw:3"       # PSE0510 camera mic (stereo muss -> downmix)
-SPK = "plughw:4"   # DS09 speaker via plug (mono/stereo + rate convert)
+MIC = "hw:CARD=PSE0510"  # Philips camera mic, by name (card numbers move)
+SPK = "plughw:CARD=DS09"  # USB speaker via plug (mono/stereo + rate convert)
 RATE = 16000
 LISTEN_S = 6
 
@@ -63,22 +63,64 @@ def blip(freq=880, ms=120):
 
 
 _ARECORD = None  # current recorder, so signals never orphan it
+_STREAM = None    # persistent mic stream: this camera's endpoint wedges on
+                  # close/reopen under Linux (works on Windows), so we open
+                  # once and read windows from the endless stream instead.
+
+
+def _open_stream():
+    global _STREAM
+    _close_stream()
+    _STREAM = subprocess.Popen(
+        ["arecord", "-q", "-D", MIC, "-f", "S16_LE", "-r", str(RATE),
+         "-c", "2", "-d", "3600", "-t", "raw"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return _STREAM
+
+
+def _close_stream():
+    global _STREAM
+    if _STREAM is not None:
+        try:
+            _STREAM.kill()
+            _STREAM.wait(timeout=3)
+        except OSError:
+            pass
+        _STREAM = None
+
+
+def _read_exact(proc, nbytes, timeout_s=LISTEN_S + 8):
+    """Blocking read of exactly nbytes (or b'' on EOF/timeout)."""
+    import select as _select
+    out, deadline = bytearray(), time.time() + timeout_s
+    fd = proc.stdout.fileno()
+    while len(out) < nbytes:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        r, _, _ = _select.select([fd], [], [], remaining)
+        if not r:
+            break
+        chunk = proc.stdout.read(nbytes - len(out))
+        if not chunk:
+            break
+        out += chunk
+    return bytes(out)
 
 
 def listen():
-    """Record one window, return mono int16 bytes (downmixed)."""
-    global _ARECORD
-    _ARECORD = subprocess.Popen(
-        ["arecord", "-q", "-D", MIC, "-f", "S16_LE", "-r", str(RATE),
-         "-c", "2", "-d", str(LISTEN_S), "-t", "raw"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    try:
-        raw, _ = _ARECORD.communicate(timeout=LISTEN_S + 10)
-    except subprocess.TimeoutExpired:
-        _ARECORD.kill()
-        raw, _ = _ARECORD.communicate()
-    finally:
-        _ARECORD = None
+    """Read one LISTEN_S window from the persistent mic stream."""
+    want = RATE * LISTEN_S * 2 * 2  # rate * s * ch * bytes
+    for attempt in ("stream", "reopen"):
+        proc = _STREAM or _open_stream()
+        if proc.poll() is not None:  # died -> reopen once
+            proc = _open_stream()
+        raw = _read_exact(proc, want)
+        if len(raw) >= want // 2:  # got usable audio
+            break
+        _close_stream()  # wedge suspected: fresh handle, one retry
+    else:
+        return b""
     n = len(raw) // 2
     if n == 0:
         return b""
@@ -93,6 +135,7 @@ def _cleanup(signum=None, frame=None):
             _ARECORD.kill()
         except OSError:
             pass
+    _close_stream()
     raise SystemExit(0)
 
 
