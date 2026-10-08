@@ -407,12 +407,23 @@ def handle_command(text):
     t = text.lower()
     if any(k in t for k in ("take a photo", "take a picture", "selfie", "cheese")):
         set_mood("happy")
+        want_desc = any(k in t for k in ("describe", "what do you see", "look at me",
+                                         "do you see", "who is", "tell me about"))
         try:
             path = _take_photo()
             log("ELBERR", f"photo saved {path}")
             open("/tmp/face_photo", "w").write(path + "\n")  # face shows it...
             set_mood("photo")
-            speak("Cheese! Saved it.")  # ...while this plays (~4s)
+            if want_desc:
+                try:
+                    desc = _describe_scene(path)
+                except Exception as e:
+                    desc = "My eyes did not cooperate."
+                    log("ELBERR", f"describe failed: {e}")
+                log("ELBERR", desc)
+                speak("Cheese! " + desc)  # ...while this plays
+            else:
+                speak("Cheese! Saved it.")  # ...while this plays (~4s)
             time.sleep(2.5)  # ...plus a beat, ~7s total
         except Exception as e:
             log("ELBERR", f"camera failed: {e}")
