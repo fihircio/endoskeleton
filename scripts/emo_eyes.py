@@ -83,7 +83,7 @@ class Face:
         elif self.mood == "sleepy":
             self.open_target = 0.35
         elif self.mood == "tired":
-            self.open_target = 0.45
+            self.open_target = 1.0  # full eye; droop comes from lid overlay
         elif self.blinking:
             self.open_target = 0.0
             if self.open < 0.05:
@@ -152,18 +152,9 @@ class Face:
             pygame.draw.arc(self.screen, self.eye, rect, math.pi * 0.15, math.pi * 0.85, 22)
             return
         if self.mood == "angry":
-            # slanted lids, inner sides low (mirrored per eye)
-            w, h = EYE_W + 14, int((EYE_H + 10) * max(o, 0.15))
-            slant = 26
-            inner_low = slant if side < 0 else 0
-            outer_low = 0 if side < 0 else slant
-            pts = [(cx - w / 2, cy - h / 2 + outer_low),
-                   (cx + w / 2, cy - h / 2 + inner_low),
-                   (cx + w / 2, cy + h / 2),
-                   (cx - w / 2, cy + h / 2)]
-            pygame.draw.polygon(self.screen, self.eye, pts)
-            return
-        if self.mood == "curious":
+            # full rounded eye; anger is a lid overlay (RoboEyes technique)
+            w, h = EYE_W + 14, EYE_H + 10
+        elif self.mood == "curious":
             # one eye taller than the other (alternates with look direction)
             tall = 1.35 if (side < 0) == (self.look[0] < 0) else 1.0
             w, h = EYE_W + 8, int((EYE_H + 6) * tall)
@@ -180,12 +171,39 @@ class Face:
         else:
             w, h = EYE_W, EYE_H
         h_vis = max(6, h * o)
-        droop = 0.65 if self.mood in ("sleepy", "tired") else 0.5
+        droop = 0.65 if self.mood == "sleepy" else 0.5
         top = cy - h / 2 + (h - h_vis) * droop
         color = self.dim if self.mood in ("sleep", "sleepy", "tired") else self.eye
         pygame.draw.rect(self.screen, color,
                          pygame.Rect(cx - w / 2, top, w, h_vis),
                          border_radius=int(min(w, h_vis) / 2 - 2))
+        # lid overlays cut from the drawn eye (background color shows through)
+        if self.mood == "angry":
+            # inner top corner cut, mirrored per eye
+            cut = h_vis * 0.55
+            if side < 0:  # left eye: cut right (inner) corner
+                pygame.draw.polygon(self.screen, BG,
+                                    [(cx + w / 2, top),
+                                     (cx + w / 2, top + cut),
+                                     (cx + w / 2 - cut * 1.6, top)])
+            else:  # right eye: cut left (inner) corner
+                pygame.draw.polygon(self.screen, BG,
+                                    [(cx - w / 2, top),
+                                     (cx - w / 2, top + cut),
+                                     (cx - w / 2 + cut * 1.6, top)])
+        elif self.mood == "tired":
+            # outer top corners droop (mirrored per eye)
+            cut = h_vis * 0.5
+            if side < 0:  # left eye: cut left (outer) corner
+                pygame.draw.polygon(self.screen, BG,
+                                    [(cx - w / 2, top),
+                                     (cx - w / 2, top + cut),
+                                     (cx - w / 2 + cut * 1.6, top)])
+            else:  # right eye: cut right (outer) corner
+                pygame.draw.polygon(self.screen, BG,
+                                    [(cx + w / 2, top),
+                                     (cx + w / 2, top + cut),
+                                     (cx + w / 2 - cut * 1.6, top)])
 
     def draw(self):
         if self.mood == "photo":
