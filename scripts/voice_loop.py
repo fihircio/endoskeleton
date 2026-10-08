@@ -184,7 +184,7 @@ def ask_llm(user_text):
     body = _json.dumps({
         "messages": [
             {"role": "system",
-             "content": "You are Emo, a tiny cute desk robot hand-built by your "
+             "content": "You are Elberr, a tiny cute desk robot hand-built by your "
                         "human on a Raspberry Pi. One short plain sentence, no lists."},
             {"role": "user", "content": user_text},
         ],
@@ -197,7 +197,7 @@ def ask_llm(user_text):
         with _url.urlopen(req, timeout=120) as r:
             choices = _json.load(r)["choices"]
     except Exception as e:  # server down? log and stay charming
-        log("EMO", f"brain unreachable: {e}")
+        log("ELBERR", f"brain unreachable: {e}")
         return "Hmm."
     if not choices:
         return "Hmm."
@@ -206,8 +206,10 @@ def ask_llm(user_text):
 
 
 def _speak_piper(text):
-    """Neural voice via local wyoming-piper server (needs :10200 up)."""
+    """Neural voice via local wyoming-piper server (needs :10200 up),
+    robotized with sox (pitch down, tempo kept) for the Elberr feel."""
     import asyncio as _aio
+    import wave as _wave
     from wyoming.audio import AudioChunk as _AC, AudioStop as _AS
     from wyoming.client import AsyncTcpClient as _Client
     from wyoming.tts import Synthesize as _Syn
@@ -226,21 +228,30 @@ def _speak_piper(text):
                     break
         return bytes(audio)
 
-    return _aio.run(_run())
+    audio = _aio.run(_run())
+    if not audio:
+        raise RuntimeError("piper empty")
+    w = _wave.open("/tmp/elberr-say.wav", "wb")
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(22050)
+    w.writeframes(audio)
+    w.close()
+    subprocess.run(["sox", "/tmp/elberr-say.wav", "/tmp/elberr-robot.wav",
+                    "pitch", "-300"],
+                   check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
+    subprocess.run(["aplay", "-q", "-D", SPK, "/tmp/elberr-robot.wav"],
+                   check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
 
 
 def speak(text):
     try:
-        audio = _speak_piper(text)  # 22050 Hz mono S16
-        p = subprocess.run(["aplay", "-q", "-D", SPK, "-f", "S16_LE",
-                            "-r", "22050", "-c", "1"],
-                           input=audio, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=60)
-        if p.returncode == 0 and audio:
-            return
-        raise RuntimeError("piper empty/failed")
+        _speak_piper(text)  # plays itself (piper + sox robotize)
+        return
     except Exception as e:
-        log("EMO", f"piper failed ({e}), espeak fallback.")
+        log("ELBERR", f"piper failed ({e}), espeak fallback.")
         p1 = subprocess.Popen(["espeak-ng", "--stdout", "-s", "135", "-v", "en", text],
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         subprocess.run(["aplay", "-q", "-D", SPK], stdin=p1.stdout,
@@ -251,7 +262,7 @@ def round_trip(user_text):
     log("YOU", user_text)
     set_mood("sleepy")  # small thinking eyes
     reply = ask_llm(user_text)
-    log("EMO", reply)
+    log("ELBERR", reply)
     set_mood("happy")   # ^ ^ while speaking
     speak(reply)
     set_mood("normal")  # big idle eyes
@@ -266,7 +277,7 @@ def main():
         round_trip(args.once)
         return
     set_mood("normal")
-    log("EMO", "voice loop online. Speak after the blip.")
+    log("ELBERR", "voice loop online. Speak after the blip.")
     import math as _math
     import signal as _signal
     # clear any recorder orphaned by a previous killed loop (-x matches
@@ -282,23 +293,23 @@ def main():
             pcm = listen()
             n = len(pcm) // 2
             if n == 0:
-                log("EMO", "mic gave no bytes.")
+                log("ELBERR", "mic gave no bytes.")
                 continue
             samp = struct.unpack(f"<{n}h", pcm)
             rms = _math.sqrt(sum(s * s for s in samp) / n)
             peak = max(abs(s) for s in samp)
             text = stt(pcm)
             if not text:
-                log("EMO", f"heard nothing (rms={rms:.0f} peak={peak}).")
+                log("ELBERR", f"heard nothing (rms={rms:.0f} peak={peak}).")
                 if not sleeping and time.time() - last_speech > 300:
                     sleeping = True
-                    log("EMO", "quiet for 5 min -> sleep.")
+                    log("ELBERR", "quiet for 5 min -> sleep.")
                 continue
             last_speech, sleeping = time.time(), False
-            log("EMO", f"mic level rms={rms:.0f} peak={peak}.")
+            log("ELBERR", f"mic level rms={rms:.0f} peak={peak}.")
             round_trip(text)
         except KeyboardInterrupt:
-            log("EMO", "going to sleep.")
+            log("ELBERR", "going to sleep.")
             set_mood("sleep")
             _cleanup()
             break
