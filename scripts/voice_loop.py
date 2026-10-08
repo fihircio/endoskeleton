@@ -305,10 +305,18 @@ def handle_command(text):
         try:
             path = _take_photo()
             log("ELBERR", f"photo saved {path}")
-            speak("Cheese! Saved it.")
+            open("/tmp/face_photo", "w").write(path + "\n")  # face shows it...
+            set_mood("photo")
+            speak("Cheese! Saved it.")  # ...while this plays (~4s)
+            time.sleep(1.0)
         except Exception as e:
             log("ELBERR", f"camera failed: {e}")
             speak("My camera did not cooperate.")
+        finally:
+            try:
+                os.remove("/tmp/face_photo")  # ...then eyes return
+            except OSError:
+                pass
         set_mood("normal")
         return True
     if any(k in t for k in ("go to sleep", "sleep now", "good night")):

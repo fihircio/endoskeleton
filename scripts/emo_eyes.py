@@ -45,9 +45,14 @@ def clamp(v, lo, hi):
 
 
 class Face:
+    PHOTO_FILE = "/tmp/face_photo"
+
     def __init__(self, screen):
         self.screen = screen
         self.mood = "normal"
+        self.photo_surf = None
+        self.photo_path = None
+        self.photo_until = 0.0
         self.open = 1.0          # eyelid: 1 open .. 0 shut
         self.open_target = 1.0
         self.look = [0.0, 0.0]
@@ -84,6 +89,33 @@ class Face:
         self.look[1] += (self.look_target[1] - self.look[1]) * k
 
     # -- drawing --------------------------------------------------------
+    def _draw_photo(self):
+        """Show /tmp/face_photo (center-cropped to 3:2) for a few seconds."""
+        import time as _t
+        try:
+            path = open(self.PHOTO_FILE).read().strip().splitlines()[0]
+        except OSError:
+            return False
+        if path != self.photo_path:
+            try:
+                img = pygame.image.load(path).convert()
+            except Exception:
+                return False
+            # center-crop to screen aspect, then scale (smooth)
+            sw, sh = img.get_size()
+            target = W / H
+            if sw / sh > target:
+                nw = int(sh * target)
+                img = img.subsurface((sw - nw) // 2, 0, nw, sh)
+            else:
+                nh = int(sw / target)
+                img = img.subsurface(0, (sh - nh) // 2, sw, nh)
+            self.photo_surf = pygame.transform.smoothscale(img, (W, H))
+            self.photo_path = path
+            self.photo_until = _t.time() + 8.0  # writer deletes file first
+        self.screen.blit(self.photo_surf, (0, 0))
+        return True
+
     def draw_eye(self, cx, cy, happy_side):
         o = self.open
         look_dx = self.look[0] * LOOK_MAX[0]
@@ -114,6 +146,11 @@ class Face:
                          border_radius=int(min(w, h_vis) / 2 - 2))
 
     def draw(self):
+        if self.mood == "photo":
+            if self._draw_photo():
+                _present(self.screen)
+                return
+            self.mood = "normal"  # photo gone -> fall through to eyes
         self.screen.fill(BG)
         if self.mood == "sleep":
             for cx, cy in (LEFT_C, RIGHT_C):
@@ -157,7 +194,7 @@ def _present(surf):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mood", default="normal",
-                    choices=["normal", "happy", "sleepy", "surprised", "sleep", "listening"])
+                    choices=["normal", "happy", "sleepy", "surprised", "sleep", "listening", "photo"])
     ap.add_argument("--demo", action="store_true", help="cycle moods every 6s")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--mood-file", default=None,
@@ -198,7 +235,7 @@ def main():
                     if mt != mood_mtime:
                         mood_mtime = mt
                         m = open(mood_file).read().strip().split()[0]
-                        if m in ("normal", "happy", "sleepy", "surprised", "sleep", "listening"):
+                        if m in ("normal", "happy", "sleepy", "surprised", "sleep", "listening", "photo"):
                             face.mood = m
                             next_switch = now + 6  # pause demo rotation
                 except OSError:
