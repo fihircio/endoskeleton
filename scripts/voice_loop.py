@@ -59,7 +59,7 @@ def _play_wav(path, device=SPK):
                    stderr=subprocess.DEVNULL)
 
 
-def blip(freq=880, ms=120):
+def blip(freq=880, ms=80):
     tone = os.path.join("/tmp", "blip.wav")
     subprocess.run(
         ["python3", "-c",
@@ -164,8 +164,8 @@ def listen():
             proc = _open_stream()
         chunk_bytes = RATE * 2 * 2 // 5  # 0.2s stereo S16
         buf, speech, quiet, elapsed = bytearray(), False, 0, 0.0
-        while elapsed < 8.0:
-            raw = _read_exact(proc, chunk_bytes, timeout_s=3.0)
+        while elapsed < 5.0:
+            raw = _read_exact(proc, chunk_bytes, timeout_s=2.5)
             if len(raw) < chunk_bytes // 2:
                 break  # stream dead; outer retry reopens
             buf += raw
@@ -174,15 +174,16 @@ def listen():
             mono = struct.unpack(f"<{n}h", raw[:n * 2])[0::2]
             level = _rms(mono)
             if not speech:
-                if level > 1500:
+                if level > 1200:
                     speech = True
                     quiet = 0
-                elif elapsed >= 6.0:
+                elif elapsed >= 4.5:
                     break  # nobody home
             else:
-                quiet = quiet + 1 if level < 700 else 0
-                if quiet >= 4 and elapsed >= 1.0:
-                    break  # 0.8s trailing silence
+                # 0.5s trailing silence ends the turn (was 0.8s)
+                quiet = quiet + 1 if level < 600 else 0
+                if quiet >= 3 and elapsed >= 0.8:
+                    break
         if len(buf) >= RATE * 2 * 2 // 2:  # >=0.5s audio
             break
         _close_stream()  # wedge suspected: fresh handle, one retry
@@ -224,13 +225,15 @@ def ask_llm(user_text):
         "model": "qwen2.5:0.5b",
         "messages": [
             {"role": "system",
-             "content": "You are Elberr, a tiny cute desk robot hand-built by your "
-                        "human on a Raspberry Pi. One short plain sentence, no lists."},
+             "content": "You are Elberr, a cute desk robot. One short sentence."},
             {"role": "user", "content": user_text},
         ],
         "stream": False,
+        # keep the model resident: otherwise Ollama unloads it after 5 min
+        # idle and the next turn pays a ~30s reload.
+        "keep_alive": "30m",
         "options": {
-            "num_predict": 25,
+            "num_predict": 16,
             "temperature": 0.7,
         },
     }).encode()
@@ -250,7 +253,7 @@ def _speak_piper(text):
     """Espeak-ng voice with sox robotize (pitch down) for the Elberr feel.
     No wyoming-piper needed — espeak-ng is already on the Pi."""
     subprocess.run(["espeak-ng", "-w", "/tmp/elberr-say.wav",
-                    "-s", "165", "-v", "en", text],
+                    "-s", "145", "-v", "en", text],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                    check=True)
     subprocess.run(["sox", "/tmp/elberr-say.wav", "/tmp/elberr-robot.wav",
