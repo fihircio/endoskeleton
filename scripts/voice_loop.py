@@ -73,106 +73,36 @@ def blip(freq=880, ms=120):
         pass
 
 
-_ARECORD = None  # current recorder, so signals never orphan it
-_STREAM = None    # persistent mic stream: this camera's endpoint wedges on
-                  # close/reopen under Linux (works on Windows), so we open
-                  # once and read windows from the endless stream instead.
-
-
-def _open_stream():
-    global _STREAM
-    _close_stream()
-    _STREAM = subprocess.Popen(
-        ["arecord", "-q", "-D", MIC, "-f", "S16_LE", "-r", str(RATE),
-         "-c", "2", "-d", "3600", "-t", "raw"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    return _STREAM
-
-
-def _close_stream():
-    global _STREAM
-    if _STREAM is not None:
-        try:
-            _STREAM.kill()
-            _STREAM.wait(timeout=3)
-        except OSError:
-            pass
-        _STREAM = None
-
-
-def _read_exact(proc, nbytes, timeout_s=LISTEN_S + 8):
-    """Blocking read of exactly nbytes (or b'' on EOF/timeout)."""
-    import select as _select
-    out, deadline = bytearray(), time.time() + timeout_s
-    fd = proc.stdout.fileno()
-    while len(out) < nbytes:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        r, _, _ = _select.select([fd], [], [], remaining)
-        if not r:
-            break
-        chunk = proc.stdout.read(nbytes - len(out))
-        if not chunk:
-            break
-        out += chunk
-    return bytes(out)
-
-
-def _rms(samples):
-    import math as _math
-    return _math.sqrt(sum(s * s for s in samples) / max(len(samples), 1))
+def _reset_mic():
+    """Re-enumerate the USB mic device. This camera mic wedges after one
+    capture on Linux; only USB re-enumeration revives the audio endpoint.
+    Uses the passwordless helper installed at /usr/local/bin/usb-mic-reset."""
+    subprocess.run(["sudo", "-n", "/usr/local/bin/usb-mic-reset", "1-1.3"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=20)
 
 
 def listen():
-    """VAD-gated window from the persistent mic stream.
+    """Record one listening window from the mic.
 
-    Records until 0.8s of trailing silence after speech (or 6s of
-    silence / 8s total cap), so typical turns take ~2s, not 6s.
+    Resets the USB mic device first (it wedges after each capture), then
+    records up to 6s. Returns mono int16 PCM bytes or b'' on silence/failure.
     """
-    for _ in ("stream", "reopen"):
-        proc = _STREAM or _open_stream()
-        if proc.poll() is not None:  # died -> reopen once
-            proc = _open_stream()
-        chunk_bytes = RATE * 2 * 2 // 5  # 0.2s stereo S16
-        buf, speech, quiet, elapsed = bytearray(), False, 0, 0.0
-        while elapsed < 8.0:
-            raw = _read_exact(proc, chunk_bytes, timeout_s=3.0)
-            if len(raw) < chunk_bytes // 2:
-                break  # stream dead; outer retry reopens
-            buf += raw
-            elapsed += 0.2
-            n = len(raw) // 2
-            mono = struct.unpack(f"<{n}h", raw[:n * 2])[0::2]
-            level = _rms(mono)
-            if not speech:
-                if level > 1500:
-                    speech = True
-                    quiet = 0
-                elif elapsed >= 6.0:
-                    break  # nobody home
-            else:
-                quiet = quiet + 1 if level < 700 else 0
-                if quiet >= 4 and elapsed >= 1.0:
-                    break  # 0.8s trailing silence
-        if len(buf) >= RATE * 2 * 2 // 2:  # >=0.5s audio
-            break
-        _close_stream()  # wedge suspected: fresh handle, one retry
-    else:
+    _reset_mic()
+    proc = subprocess.run(
+        ["arecord", "-q", "-D", MIC, "-f", "S16_LE", "-r", str(RATE),
+         "-c", "2", "-d", "6", "-t", "raw"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+    raw = proc.stdout
+    n = len(raw) // 2
+    if n == 0:
         return b""
-    n = len(buf) // 2
-    stereo = struct.unpack(f"<{n}h", bytes(buf[:n * 2]))
+    stereo = struct.unpack(f"<{n}h", raw[:n * 2])
     mono = [(a + b) // 2 for a, b in zip(stereo[0::2], stereo[1::2])]
     return struct.pack(f"<{len(mono)}h", *mono)
 
 
 def _cleanup(signum=None, frame=None):
-    if _ARECORD is not None:
-        try:
-            _ARECORD.kill()
-        except OSError:
-            pass
-    _close_stream()
     raise SystemExit(0)
 
 
@@ -186,68 +116,45 @@ def stt(pcm):
 
 
 def ask_llm(user_text):
-    """Chat via local llama-server (needs: llama serve -m MODEL --port 8080).
+    """Chat via local Ollama server (needs: ollama serve + ollama pull qwen2.5:0.5b).
 
     Server keeps the model resident, so turns take ~3s instead of ~20s.
     """
     import json as _json
     import urllib.request as _url
     body = _json.dumps({
+        "model": "qwen2.5:0.5b",
         "messages": [
             {"role": "system",
              "content": "You are Elberr, a tiny cute desk robot hand-built by your "
                         "human on a Raspberry Pi. One short plain sentence, no lists."},
             {"role": "user", "content": user_text},
         ],
-        "max_tokens": 25,
-        "temperature": 0.7,
+        "stream": False,
+        "options": {
+            "num_predict": 25,
+            "temperature": 0.7,
+        },
     }).encode()
     try:
-        req = _url.Request("http://localhost:8080/v1/chat/completions",
+        req = _url.Request("http://localhost:11434/api/chat",
                            data=body, headers={"Content-Type": "application/json"})
         with _url.urlopen(req, timeout=120) as r:
-            choices = _json.load(r)["choices"]
+            data = _json.load(r)
     except Exception as e:  # server down? log and stay charming
         log("ELBERR", f"brain unreachable: {e}")
         return "Hmm."
-    if not choices:
-        return "Hmm."
-    reply = choices[0]["message"]["content"]
+    reply = data.get("message", {}).get("content", "").strip()
     return " ".join(reply.split())[:280] or "Hmm."
 
 
 def _speak_piper(text):
-    """Neural voice via local wyoming-piper server (needs :10200 up),
-    robotized with sox (pitch down, tempo kept) for the Elberr feel."""
-    import asyncio as _aio
-    import wave as _wave
-    from wyoming.audio import AudioChunk as _AC, AudioStop as _AS
-    from wyoming.client import AsyncTcpClient as _Client
-    from wyoming.tts import Synthesize as _Syn
-
-    async def _run():
-        audio = bytearray()
-        async with _Client("127.0.0.1", 10200) as client:
-            await client.write_event(_Syn(text=text).event())
-            while True:
-                event = await client.read_event()
-                if event is None:
-                    break
-                if _AC.is_type(event.type):
-                    audio += _AC.from_event(event).audio
-                elif _AS.is_type(event.type):
-                    break
-        return bytes(audio)
-
-    audio = _aio.run(_run())
-    if not audio:
-        raise RuntimeError("piper empty")
-    w = _wave.open("/tmp/elberr-say.wav", "wb")
-    w.setnchannels(1)
-    w.setsampwidth(2)
-    w.setframerate(22050)
-    w.writeframes(audio)
-    w.close()
+    """Espeak-ng voice with sox robotize (pitch down) for the Elberr feel.
+    No wyoming-piper needed — espeak-ng is already on the Pi."""
+    subprocess.run(["espeak-ng", "-w", "/tmp/elberr-say.wav",
+                    "-s", "165", "-v", "en", text],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   check=True)
     subprocess.run(["sox", "/tmp/elberr-say.wav", "/tmp/elberr-robot.wav",
                     "pitch", "-300"],
                    check=True, stdout=subprocess.DEVNULL,
@@ -256,15 +163,7 @@ def _speak_piper(text):
 
 
 def speak(text):
-    try:
-        _speak_piper(text)  # plays itself (piper + sox robotize)
-        return
-    except Exception as e:
-        log("ELBERR", f"piper failed ({e}), espeak fallback.")
-        subprocess.run(["espeak-ng", "-w", "/tmp/elberr-espeak.wav",
-                        "-s", "135", "-v", "en", text],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _play_wav("/tmp/elberr-espeak.wav")
+    _speak_piper(text)
 
 
 def round_trip(user_text):
@@ -545,41 +444,19 @@ def main():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _signal.signal(_signal.SIGTERM, _cleanup)
     last_speech, sleeping = time.time(), False
-    dead_streak, last_reset = 0, 0.0
     while True:
         try:
             set_mood("sleep" if sleeping else "listening")
-            if dead_streak >= 3:
-                # Mic wedged. This camera's endpoint only recovers via USB
-                # re-enumeration; heal it ourselves (max once per 5 min),
-                # else back off quietly instead of blipping constantly.
-                if time.time() - last_reset > 300:
-                    last_reset = time.time()
-                    log("ELBERR", "mic dead, resetting USB audio.")
-                    subprocess.run(
-                        ["sudo", "-n", "/usr/local/bin/usb-audio-reset"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        timeout=60)
-                    time.sleep(10)  # re-enumerate
-                    set_mood("listening")
-                else:
-                    log("ELBERR", "mic dead, backing off 60s.")
-                    set_mood("sleep")
-                    time.sleep(60)
-                dead_streak = 0
-                continue
             blip()
-            pcm = listen()
+            pcm = listen()  # resets the USB mic device itself
             n = len(pcm) // 2
             if n == 0:
-                dead_streak += 1
                 log("ELBERR", "mic gave no bytes.")
                 continue
             samp = struct.unpack(f"<{n}h", pcm)
             rms = _math.sqrt(sum(s * s for s in samp) / n)
             peak = max(abs(s) for s in samp)
             text = stt(pcm)
-            dead_streak = 0  # mic delivered audio; only speech was absent
             if not text:
                 log("ELBERR", f"heard nothing (rms={rms:.0f} peak={peak}).")
                 if not sleeping and time.time() - last_speech > 300:
@@ -590,7 +467,6 @@ def main():
                 sleeping = False
                 log("ELBERR", "woke up.")
             last_speech = time.time()
-            dead_streak = 0
             log("ELBERR", f"mic level rms={rms:.0f} peak={peak}.")
             cmd = handle_command(text)
             if cmd == "sleep":
