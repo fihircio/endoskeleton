@@ -157,7 +157,7 @@ def _reset_mic():
 # it, so a wake phrase like "hey elberr" cannot work). Keep plain English.
 # Override with ELBERR_WAKE="hey dude,hey man".
 WAKE_PHRASES = [p.strip() for p in os.environ.get(
-    "ELBERR_WAKE", "hey dude,hey man,hey buddy,dude").split(",") if p.strip()]
+    "ELBERR_WAKE", "hey dude,hey man,hey buddy").split(",") if p.strip()]
 # Set ELBERR_NO_WAKE=1 to disable wake gating (always listening).
 NO_WAKE = os.environ.get("ELBERR_NO_WAKE", "") == "1"
 # Chunks (0.2s each) the STT partial must stay identical before we treat the
@@ -204,7 +204,9 @@ class Ears:
         quiet = level < 600
         if not NO_WAKE:
             w = json.loads(self.rec_wake.PartialResult()).get("partial", "")
-            if w.strip():
+            # require a complete multi-word phrase: a bare "hey" partial would
+            # otherwise fire the wake before the second word arrives
+            if len(w.split()) >= 2:
                 return ("wake", w.strip())
             if quiet:
                 # finalise the wake recogniser so its state never sticks
