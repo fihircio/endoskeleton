@@ -14,7 +14,8 @@
 //     {"enable":false}                -> ACTIVE -> DISABLED (PWM off)
 //     {"estop":true}                  -> ANY -> EMERGENCY_STOP (latched, PWM off)
 //     {"reset":true}                  -> EMERGENCY_STOP -> DISABLED
-//     {"joints":{"left_elbow_pitch":1.57,"head_pan":0.2}}  (radians, ACTIVE only)
+//     {"joints":{"left_elbow_pitch":1.57,"right_elbow_pitch":1.57}}  (radians, ACTIVE only)
+//     PCA9685 channels: left_elbow_pitch=2, right_elbow_pitch=4
 //   Wemos -> Pi (2 Hz status + replies):
 //     {"state":"ACTIVE","positions":{"left_elbow_pitch":1.56,...},"t_ms":12345}
 //     {"error":"unknown joint foo"}   (non-fatal, stays ACTIVE)
@@ -55,9 +56,8 @@ struct Joint {
 };
 
 Joint joints[] = {
-  {"left_elbow_pitch",  0, 0.17, 2.97, 1.57, 10.0, 170.0,  500, 2500, false, 1.047f, 1.57, 1.57},
-  {"right_elbow_pitch", 1, 0.17, 2.97, 1.57, 10.0, 170.0,  500, 2500, true,  1.047f, 1.57, 1.57},
-  {"head_pan",          2, -1.40, 1.40, 0.0, 10.0, 170.0,  500, 2500, false, 1.571f, 0.0,  0.0},
+  {"left_elbow_pitch",  2, 0.17, 2.97, 1.57, 10.0, 170.0,  500, 2500, false, 1.047f, 1.57, 1.57},
+  {"right_elbow_pitch", 4, 0.17, 2.97, 1.57, 10.0, 170.0,  500, 2500, true,  1.047f, 1.57, 1.57},
 };
 const int NJOINTS = sizeof(joints) / sizeof(joints[0]);
 
