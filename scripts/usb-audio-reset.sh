@@ -1,22 +1,29 @@
 #!/bin/sh
-# Self-healing for the Philips PSE0510 mic: its audio endpoint wedges until
-# USB re-enumeration (works on Windows, grumpy snd-usb-audio teardown on
-# Linux). Finds the mic's parent hub dynamically and power-cycles it.
-# Installed (once) as root:
+# Reset the Philips PSE0510 USB camera mic by re-enumerating its parent hub.
+# This mic's audio endpoint wedges after prolonged use on Linux (works on
+# Windows); only a USB re-enumeration revives it.
+# Re-enumeration restores DEFAULT mixer settings (mic gain back to 95% =
+# clipping), so we re-apply a sane capture level here too.
+# Install:
 #   sudo cp usb-audio-reset.sh /usr/local/bin/usb-audio-reset
 #   sudo chmod 755 /usr/local/bin/usb-audio-reset
 #   echo 'pi ALL=(ALL) NOPASSWD: /usr/local/bin/usb-audio-reset' \
 #     | sudo tee /etc/sudoers.d/usb-audio-reset
 #   sudo chmod 440 /etc/sudoers.d/usb-audio-reset
 set -e
-DEV=$(grep -l 0c45 /sys/bus/usb/devices/*/idVendor 2>/dev/null | head -1)
-if [ -z "$DEV" ]; then
-  echo "mic not on USB bus" >&2
-  exit 1
-fi
-D=$(basename "$(dirname "$DEV")")
-HUB=${D%.*}
-echo "resetting hub $HUB (mic at $D)" >&2
+HUB=${1:-1-1}
+GAIN=${2:-50}
+
 echo "$HUB" > /sys/bus/usb/drivers/usb/unbind
 sleep 3
 echo "$HUB" > /sys/bus/usb/drivers/usb/bind
+sleep 4
+
+# card index shifts after re-enumeration -> look it up by name
+CARD=$(awk '/PSE0510/{print $1; exit}' /proc/asound/cards 2>/dev/null | tr -d ':')
+if [ -n "$CARD" ]; then
+  amixer -c "$CARD" set Mic "$GAIN%" >/dev/null 2>&1 || true
+  echo "hub $HUB re-enumerated, card $CARD, mic gain ${GAIN}%" >&2
+else
+  echo "hub $HUB re-enumerated (PSE0510 card not found yet)" >&2
+fi

@@ -73,36 +73,134 @@ def blip(freq=880, ms=120):
         pass
 
 
+def _rms(samples):
+    import math as _math
+    return _math.sqrt(sum(s * s for s in samples) / max(len(samples), 1))
+
+
+_ARECORD = None  # current recorder, so signals never orphan it
+_STREAM = None    # persistent mic stream: this camera's endpoint wedges on
+                  # close/reopen under Linux (works on Windows), so we open
+                  # once and read windows from the endless stream instead.
+
+
+def _set_mic_gain(pct=50):
+    """Set the mic capture level. USB re-enumeration restores the 95%
+    default (clipping), so this runs at startup and after every reset."""
+    try:
+        card = ""
+        with open("/proc/asound/cards") as f:
+            for line in f:
+                if "PSE0510" in line:
+                    card = line.split()[0].rstrip(":")
+                    break
+        if card:
+            subprocess.run(["amixer", "-c", card, "set", "Mic", f"{pct}%"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+    except Exception:
+        pass
+
+
+def _open_stream():
+    global _STREAM
+    _close_stream()
+    _STREAM = subprocess.Popen(
+        ["arecord", "-q", "-D", MIC, "-f", "S16_LE", "-r", str(RATE),
+         "-c", "2", "-d", "3600", "-t", "raw"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return _STREAM
+
+
+def _close_stream():
+    global _STREAM
+    if _STREAM is not None:
+        try:
+            _STREAM.kill()
+            _STREAM.wait(timeout=3)
+        except OSError:
+            pass
+        _STREAM = None
+
+
+def _read_exact(proc, nbytes, timeout_s=LISTEN_S + 8):
+    """Blocking read of exactly nbytes (or b'' on EOF/timeout)."""
+    import select as _select
+    out, deadline = bytearray(), time.time() + timeout_s
+    fd = proc.stdout.fileno()
+    while len(out) < nbytes:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        r, _, _ = _select.select([fd], [], [], remaining)
+        if not r:
+            break
+        chunk = proc.stdout.read(nbytes - len(out))
+        if not chunk:
+            break
+        out += chunk
+    return bytes(out)
+
+
 def _reset_mic():
-    """Re-enumerate the USB mic device. This camera mic wedges after one
-    capture on Linux; only USB re-enumeration revives the audio endpoint.
-    Uses the passwordless helper installed at /usr/local/bin/usb-mic-reset."""
-    subprocess.run(["sudo", "-n", "/usr/local/bin/usb-mic-reset", "1-1.3"],
+    """Re-enumerate the whole USB hub when the mic endpoint wedges.
+    Only used as a last resort (the stream normally survives hours)."""
+    subprocess.run(["sudo", "-n", "/usr/local/bin/usb-audio-reset"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   timeout=20)
+                   timeout=60)
+    time.sleep(6)
+    _close_stream()
 
 
 def listen():
-    """Record one listening window from the mic.
+    """VAD-gated window from the persistent mic stream.
 
-    Resets the USB mic device first (it wedges after each capture), then
-    records up to 6s. Returns mono int16 PCM bytes or b'' on silence/failure.
+    Records until 0.8s of trailing silence after speech (or 6s of
+    silence / 8s total cap), so typical turns take ~2s, not 6s.
     """
-    _reset_mic()
-    proc = subprocess.run(
-        ["arecord", "-q", "-D", MIC, "-f", "S16_LE", "-r", str(RATE),
-         "-c", "2", "-d", "6", "-t", "raw"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
-    raw = proc.stdout
-    n = len(raw) // 2
-    if n == 0:
+    for attempt in ("stream", "reopen"):
+        proc = _STREAM or _open_stream()
+        if proc.poll() is not None:  # died -> reopen once
+            proc = _open_stream()
+        chunk_bytes = RATE * 2 * 2 // 5  # 0.2s stereo S16
+        buf, speech, quiet, elapsed = bytearray(), False, 0, 0.0
+        while elapsed < 8.0:
+            raw = _read_exact(proc, chunk_bytes, timeout_s=3.0)
+            if len(raw) < chunk_bytes // 2:
+                break  # stream dead; outer retry reopens
+            buf += raw
+            elapsed += 0.2
+            n = len(raw) // 2
+            mono = struct.unpack(f"<{n}h", raw[:n * 2])[0::2]
+            level = _rms(mono)
+            if not speech:
+                if level > 1500:
+                    speech = True
+                    quiet = 0
+                elif elapsed >= 6.0:
+                    break  # nobody home
+            else:
+                quiet = quiet + 1 if level < 700 else 0
+                if quiet >= 4 and elapsed >= 1.0:
+                    break  # 0.8s trailing silence
+        if len(buf) >= RATE * 2 * 2 // 2:  # >=0.5s audio
+            break
+        _close_stream()  # wedge suspected: fresh handle, one retry
+    else:
         return b""
-    stereo = struct.unpack(f"<{n}h", raw[:n * 2])
+    n = len(buf) // 2
+    stereo = struct.unpack(f"<{n}h", bytes(buf[:n * 2]))
     mono = [(a + b) // 2 for a, b in zip(stereo[0::2], stereo[1::2])]
     return struct.pack(f"<{len(mono)}h", *mono)
 
 
 def _cleanup(signum=None, frame=None):
+    if _ARECORD is not None:
+        try:
+            _ARECORD.kill()
+        except OSError:
+            pass
+    _close_stream()
     raise SystemExit(0)
 
 
@@ -442,21 +540,40 @@ def main():
     # the process name only, so it can never match our own shell)
     subprocess.run(["pkill", "-x", "arecord"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _set_mic_gain()
     _signal.signal(_signal.SIGTERM, _cleanup)
     last_speech, sleeping = time.time(), False
+    dead_streak, last_reset = 0, 0.0
     while True:
         try:
             set_mood("sleep" if sleeping else "listening")
+            if dead_streak >= 3:
+                # Mic endpoint wedged. The persistent stream normally survives
+                # for hours; a hub re-enumeration is the last-resort heal
+                # (max once per 5 min), else back off quietly.
+                if time.time() - last_reset > 300:
+                    last_reset = time.time()
+                    log("ELBERR", "mic dead, resetting USB audio.")
+                    _reset_mic()
+                    set_mood("listening")
+                else:
+                    log("ELBERR", "mic dead, backing off 60s.")
+                    set_mood("sleep")
+                    time.sleep(60)
+                dead_streak = 0
+                continue
             blip()
-            pcm = listen()  # resets the USB mic device itself
+            pcm = listen()
             n = len(pcm) // 2
             if n == 0:
+                dead_streak += 1
                 log("ELBERR", "mic gave no bytes.")
                 continue
             samp = struct.unpack(f"<{n}h", pcm)
             rms = _math.sqrt(sum(s * s for s in samp) / n)
             peak = max(abs(s) for s in samp)
             text = stt(pcm)
+            dead_streak = 0  # mic delivered audio; only speech was absent
             if not text:
                 log("ELBERR", f"heard nothing (rms={rms:.0f} peak={peak}).")
                 if not sleeping and time.time() - last_speech > 300:
