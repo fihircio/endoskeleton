@@ -152,47 +152,80 @@ def _reset_mic():
     _close_stream()
 
 
-def listen():
-    """VAD-gated window from the persistent mic stream.
+# Wake phrases. IMPORTANT: every word must exist in the Vosk model's
+# vocabulary or it is silently dropped from the grammar ("elberr" is NOT in
+# it, so a wake phrase like "hey elberr" cannot work). Keep plain English.
+# Override with ELBERR_WAKE="hey dude,hey man".
+WAKE_PHRASES = [p.strip() for p in os.environ.get(
+    "ELBERR_WAKE", "hey dude,hey man,hey buddy,dude").split(",") if p.strip()]
+# Set ELBERR_NO_WAKE=1 to disable wake gating (always listening).
+NO_WAKE = os.environ.get("ELBERR_NO_WAKE", "") == "1"
+# Chunks (0.2s each) the STT partial must stay identical before we treat the
+# utterance as finished and start thinking. 3 = 0.6s of stillness.
+STABLE_CHUNKS = 3
+CHUNK_S = 0.2
+SILENCE_CHUNKS_TO_ABANDON = 8  # 1.6s of silence after wake -> give up
 
-    Records until 0.8s of trailing silence after speech (or 6s of
-    silence / 8s total cap), so typical turns take ~2s, not 6s.
+
+class Ears:
+    """Two parallel Vosk recognizers over one audio stream.
+
+    rec_wake is grammar-constrained to the wake phrases; rec_cmd is free-form.
+    The wake recognizer is cheap to poll and tells us when to start capturing
+    a command. rec_cmd's partial results let us start thinking while the
+    user is still finishing their sentence.
     """
-    for attempt in ("stream", "reopen"):
-        proc = _STREAM or _open_stream()
-        if proc.poll() is not None:  # died -> reopen once
-            proc = _open_stream()
-        chunk_bytes = RATE * 2 * 2 // 5  # 0.2s stereo S16
-        buf, speech, quiet, elapsed = bytearray(), False, 0, 0.0
-        while elapsed < 5.0:
-            raw = _read_exact(proc, chunk_bytes, timeout_s=2.5)
-            if len(raw) < chunk_bytes // 2:
-                break  # stream dead; outer retry reopens
-            buf += raw
-            elapsed += 0.2
-            n = len(raw) // 2
-            mono = struct.unpack(f"<{n}h", raw[:n * 2])[0::2]
-            level = _rms(mono)
-            if not speech:
-                if level > 1200:
-                    speech = True
-                    quiet = 0
-                elif elapsed >= 4.5:
-                    break  # nobody home
+
+    def __init__(self):
+        from vosk import KaldiRecognizer, Model
+        self.model = Model(VOSK_DIR)
+        self.rec_wake = KaldiRecognizer(self.model, RATE)
+        self.rec_wake.SetGrammar(json.dumps(WAKE_PHRASES + ["[unk]"]))
+        self.rec_cmd = KaldiRecognizer(self.model, RATE)
+        self.rec_cmd.SetWords(False)
+        self.last_partial = ""
+        self.stable = 0
+
+    def reset_cmd(self):
+        self.rec_cmd.Reset()
+        self.last_partial = ""
+        self.stable = 0
+
+    def feed(self, pcm, level):
+        """Feed one chunk. Returns (kind, text).
+
+        kind: 'wake'   -> wake phrase spotted
+              'stable' -> command text looks complete (partial unchanged)
+              'final'  -> recognizer finalised a phrase
+              None     -> nothing yet
+        """
+        self.rec_wake.AcceptWaveform(pcm)
+        self.rec_cmd.AcceptWaveform(pcm)
+        quiet = level < 600
+        if not NO_WAKE:
+            w = json.loads(self.rec_wake.PartialResult()).get("partial", "")
+            if w.strip():
+                return ("wake", w.strip())
+            if quiet:
+                # finalise the wake recogniser so its state never sticks
+                json.loads(self.rec_wake.Result())
+        p = json.loads(self.rec_cmd.PartialResult()).get("partial", "")
+        if p.strip():
+            if p == self.last_partial:
+                self.stable += 1
             else:
-                # 0.5s trailing silence ends the turn (was 0.8s)
-                quiet = quiet + 1 if level < 600 else 0
-                if quiet >= 3 and elapsed >= 0.8:
-                    break
-        if len(buf) >= RATE * 2 * 2 // 2:  # >=0.5s audio
-            break
-        _close_stream()  # wedge suspected: fresh handle, one retry
-    else:
-        return b""
-    n = len(buf) // 2
-    stereo = struct.unpack(f"<{n}h", bytes(buf[:n * 2]))
-    mono = [(a + b) // 2 for a, b in zip(stereo[0::2], stereo[1::2])]
-    return struct.pack(f"<{len(mono)}h", *mono)
+                self.stable = 0
+                self.last_partial = p
+            if self.stable >= STABLE_CHUNKS:
+                return ("stable", p.strip())
+            return (None, p.strip())
+        if quiet:
+            # only finalise on silence — calling Result() mid-utterance
+            # would cut the recogniser's state short
+            final = json.loads(self.rec_cmd.Result()).get("text", "").strip()
+            if final:
+                return ("final", final)
+        return (None, "")
 
 
 def _cleanup(signum=None, frame=None):
@@ -205,13 +238,6 @@ def _cleanup(signum=None, frame=None):
     raise SystemExit(0)
 
 
-def stt(pcm):
-    from vosk import KaldiRecognizer, Model
-    if not hasattr(stt, "rec"):
-        stt.rec = KaldiRecognizer(Model(VOSK_DIR), RATE)
-        stt.rec.SetWords(False)
-    stt.rec.AcceptWaveform(pcm)
-    return json.loads(stt.rec.FinalResult()).get("text", "").strip()
 
 
 def ask_llm(user_text):
@@ -537,6 +563,7 @@ def main():
         return
     set_mood("normal")
     log("ELBERR", "voice loop online. Speak after the blip.")
+    log("ELBERR", f"wake phrases: {', '.join(WAKE_PHRASES) if not NO_WAKE else 'DISABLED (always listening)'}")
     import math as _math
     import signal as _signal
     # clear any recorder orphaned by a previous killed loop (-x matches
@@ -547,9 +574,12 @@ def main():
     _signal.signal(_signal.SIGTERM, _cleanup)
     last_speech, sleeping = time.time(), False
     dead_streak, last_reset = 0, 0.0
+    ears = Ears()
+    armed = False           # wake heard -> capturing a command
+    silence = 0            # chunks of silence while armed
+    chunk_bytes = RATE * 2 * 2 // 5  # 0.2s stereo S16
     while True:
         try:
-            set_mood("sleep" if sleeping else "listening")
             if dead_streak >= 3:
                 # Mic endpoint wedged. The persistent stream normally survives
                 # for hours; a hub re-enumeration is the last-resort heal
@@ -565,35 +595,64 @@ def main():
                     time.sleep(60)
                 dead_streak = 0
                 continue
-            blip()
-            pcm = listen()
-            n = len(pcm) // 2
-            if n == 0:
+
+            if not armed:
+                set_mood("sleep" if sleeping else "listening")
+            proc = _STREAM or _open_stream()
+            if proc.poll() is not None:
+                proc = _open_stream()
+            raw = _read_exact(proc, chunk_bytes, timeout_s=3.0)
+            if len(raw) < chunk_bytes // 2:
                 dead_streak += 1
                 log("ELBERR", "mic gave no bytes.")
                 continue
-            samp = struct.unpack(f"<{n}h", pcm)
-            rms = _math.sqrt(sum(s * s for s in samp) / n)
-            peak = max(abs(s) for s in samp)
-            text = stt(pcm)
-            dead_streak = 0  # mic delivered audio; only speech was absent
-            if not text:
-                log("ELBERR", f"heard nothing (rms={rms:.0f} peak={peak}).")
-                if not sleeping and time.time() - last_speech > 300:
-                    sleeping = True
-                    log("ELBERR", "quiet for 5 min -> sleep.")
+            dead_streak = 0
+            pcm_chunk = raw
+            n = len(pcm_chunk) // 2
+            stereo = struct.unpack(f"<{n}h", pcm_chunk[:n * 2])
+            mono = struct.pack(f"<{n // 2}h",
+                               *[(a + b) // 2 for a, b in
+                                 zip(stereo[0::2], stereo[1::2])])
+            level = _rms(struct.unpack(f"<{n // 2}h", mono))
+
+            kind, text = ears.feed(mono, level)
+
+            if not armed:
+                if kind == "wake":
+                    if sleeping:
+                        sleeping = False
+                        log("ELBERR", "woke up.")
+                    log("ELBERR", f"wake phrase heard ({text}).")
+                    ears.reset_cmd()
+                    armed = True
+                    silence = 0
+                    blip()  # "I'm listening"
+                    set_mood("listening")
                 continue
-            if sleeping:
-                sleeping = False
-                log("ELBERR", "woke up.")
-            last_speech = time.time()
-            log("ELBERR", f"mic level rms={rms:.0f} peak={peak}.")
-            cmd = handle_command(text)
-            if cmd == "sleep":
-                sleeping = True
-            elif cmd != "wake":
-                if not cmd:
-                    round_trip(text)
+
+            # ---- armed: capturing a command ----
+            if kind in ("stable", "final") and text:
+                log("ELBERR", f"mic level rms={level:.0f}.")
+                log("YOU", text)
+                cmd = handle_command(text)
+                if cmd == "sleep":
+                    sleeping = True
+                elif cmd != "wake":
+                    if not cmd:
+                        round_trip(text)
+                armed = False
+                ears.reset_cmd()
+                set_mood("normal")
+                continue
+            if not text:
+                silence += 1
+                if silence >= SILENCE_CHUNKS_TO_ABANDON:
+                    log("ELBERR", "nothing after wake, back to idle.")
+                    armed = False
+                    ears.reset_cmd()
+                    set_mood("normal")
+            else:
+                silence = 0
         except KeyboardInterrupt:
             log("ELBERR", "going to sleep.")
             set_mood("sleep")
