@@ -15,9 +15,11 @@ import argparse
 import datetime
 import json
 import os
+import queue
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 HOME = os.path.expanduser("~")
@@ -79,9 +81,14 @@ def _rms(samples):
 
 
 _ARECORD = None  # current recorder, so signals never orphan it
-_STREAM = None    # persistent mic stream: this camera's endpoint wedges on
-                  # close/reopen under Linux (works on Windows), so we open
-                  # once and read windows from the endless stream instead.
+_STREAM = None    # capture window on the mic (owned by _capture_loop)
+_STOP = threading.Event()
+# Audio queue: the capture thread drains the USB mic into this queue and the
+# main thread does the STT. Without this split, Vosk's per-chunk decoding
+# (which can take longer than real time) makes ALSA overrun the capture
+# buffer -> "overrun!!!" -> the mic stream dies.
+_AUDIO_Q = queue.Queue(maxsize=60)   # ~12 s of audio, newest wins
+CHUNK_BYTES = RATE * 2 * 2 // 5      # 0.2 s stereo S16
 
 
 def _set_mic_gain(pct=50):
@@ -103,12 +110,19 @@ def _set_mic_gain(pct=50):
 
 
 def _open_stream():
+    """Open a capture window on the mic.
+
+    NOTE on this Philips PSE0510: the device dies on close/reopen, so the
+    window is a long-ish single arecord (-d 60) that we read progressively,
+    and the device is re-enumerated between windows (see _reset_mic).
+    """
     global _STREAM
     _close_stream()
+    err = open("/tmp/arecord_err.log", "ab")
     _STREAM = subprocess.Popen(
         ["arecord", "-q", "-D", MIC, "-f", "S16_LE", "-r", str(RATE),
-         "-c", "2", "-d", "3600", "-t", "raw"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+         "-c", "2", "-d", "60", "-t", "raw"],
+        stdout=subprocess.PIPE, stderr=err)
     return _STREAM
 
 
@@ -143,13 +157,19 @@ def _read_exact(proc, nbytes, timeout_s=LISTEN_S + 8):
 
 
 def _reset_mic():
-    """Re-enumerate the whole USB hub when the mic endpoint wedges.
-    Only used as a last resort (the stream normally survives hours)."""
-    subprocess.run(["sudo", "-n", "/usr/local/bin/usb-audio-reset"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   timeout=60)
-    time.sleep(6)
+    """Re-enumerate the USB mic device. This camera mic only survives one
+    open per enumeration, so the device must be re-bound between windows.
+    The stream must be released BEFORE the unbind, or the unbind fails."""
     _close_stream()
+    time.sleep(0.5)
+    try:
+        p = subprocess.run(["sudo", "-n", "/usr/local/bin/usb-audio-reset", "auto"],
+                           capture_output=True, text=True, timeout=60)
+        log("ELBERR", f"mic reset: rc={p.returncode} "
+                      f"{(p.stdout or '').strip()} {(p.stderr or '').strip()}")
+    except Exception as e:
+        log("ELBERR", f"mic reset failed: {e}")
+    time.sleep(3)
 
 
 # Wake phrases. IMPORTANT: every word must exist in the Vosk model's
@@ -164,7 +184,8 @@ NO_WAKE = os.environ.get("ELBERR_NO_WAKE", "") == "1"
 # utterance as finished and start thinking. 3 = 0.6s of stillness.
 STABLE_CHUNKS = 3
 CHUNK_S = 0.2
-SILENCE_CHUNKS_TO_ABANDON = 8  # 1.6s of silence after wake -> give up
+SILENCE_CHUNKS_TO_ABANDON = 60  # 12 s of silence after wake -> give up
+                                # (the human needs time to speak the command)
 
 
 class Ears:
@@ -178,6 +199,11 @@ class Ears:
 
     def __init__(self):
         from vosk import KaldiRecognizer, Model
+        try:
+            from vosk import SetLogLevel
+            SetLogLevel(-1)  # silence Vosk's INFO spam (it floods the journal)
+        except Exception:
+            pass
         self.model = Model(VOSK_DIR)
         self.rec_wake = KaldiRecognizer(self.model, RATE)
         self.rec_wake.SetGrammar(json.dumps(WAKE_PHRASES + ["[unk]"]))
@@ -185,11 +211,19 @@ class Ears:
         self.rec_cmd.SetWords(False)
         self.last_partial = ""
         self.stable = 0
+        self.since_flush = 0.0
+        self.chunk_s = 0.2
+        # A recognizer that never finalises grows an unbounded lattice and
+        # eventually spends MINUTES in lattice determinisation (Vosk warns
+        # "size exceeds maximum 50000000 bytes"). We therefore force a
+        # flush if an utterance has been open for this long.
+        self.max_utterance_s = 8.0
 
     def reset_cmd(self):
         self.rec_cmd.Reset()
         self.last_partial = ""
         self.stable = 0
+        self.since_flush = 0.0
 
     def feed(self, pcm, level):
         """Feed one chunk. Returns (kind, text).
@@ -201,16 +235,22 @@ class Ears:
         """
         self.rec_wake.AcceptWaveform(pcm)
         self.rec_cmd.AcceptWaveform(pcm)
+        self.since_flush += self.chunk_s
         quiet = level < 600
+        overdue = self.since_flush > self.max_utterance_s
+
         if not NO_WAKE:
             w = json.loads(self.rec_wake.PartialResult()).get("partial", "")
-            # require a complete multi-word phrase: a bare "hey" partial would
-            # otherwise fire the wake before the second word arrives
             if len(w.split()) >= 2:
+                # Reset the wake recogniser, otherwise it keeps re-matching
+                # the phrase in its buffer and every later chunk is
+                # classified "wake" (the command would never be heard).
+                self.rec_wake.Reset()
                 return ("wake", w.strip())
-            if quiet:
-                # finalise the wake recogniser so its state never sticks
+            if quiet or overdue:
                 json.loads(self.rec_wake.Result())
+                if quiet:
+                    self.since_flush = 0.0
         p = json.loads(self.rec_cmd.PartialResult()).get("partial", "")
         if p.strip():
             if p == self.last_partial:
@@ -221,21 +261,55 @@ class Ears:
             if self.stable >= STABLE_CHUNKS:
                 return ("stable", p.strip())
             return (None, p.strip())
-        if quiet:
-            # only finalise on silence — calling Result() mid-utterance
-            # would cut the recogniser's state short
+        if quiet or overdue:
+            # only finalise on silence (or when the utterance is overdue) —
+            # calling Result() mid-utterance would cut the state short
             final = json.loads(self.rec_cmd.Result()).get("text", "").strip()
+            self.since_flush = 0.0
             if final:
                 return ("final", final)
         return (None, "")
 
 
-def _cleanup(signum=None, frame=None):
-    if _ARECORD is not None:
+def _capture_loop():
+    """Owns the microphone.
+
+    Opens a capture window, drains it into _AUDIO_Q as fast as the device
+    delivers, and re-enumerates the USB device when the window ends (this
+    camera mic only survives one open per enumeration). This thread must
+    never block on STT - that is the whole point of the queue.
+    """
+    while not _STOP.is_set():
+        proc = _open_stream()
         try:
-            _ARECORD.kill()
-        except OSError:
-            pass
+            while not _STOP.is_set() and proc.poll() is None:
+                raw = _read_exact(proc, CHUNK_BYTES, timeout_s=2.0)
+                if not raw:
+                    continue
+                try:
+                    _AUDIO_Q.put_nowait(raw)
+                except queue.Full:
+                    # keep the freshest audio: drop the oldest
+                    try:
+                        _AUDIO_Q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        _AUDIO_Q.put_nowait(raw)
+                    except queue.Full:
+                        pass
+        except Exception as e:
+            log("ELBERR", f"capture error: {e}")
+        finally:
+            _close_stream()
+        if _STOP.is_set():
+            break
+        log("ELBERR", "mic window ended, re-enumerating.")
+        _reset_mic()
+
+
+def _cleanup(signum=None, frame=None):
+    _STOP.set()
     _close_stream()
     raise SystemExit(0)
 
@@ -342,7 +416,13 @@ def _servo_connect():
         return None
 
 
-SERVO = _servo_connect()
+SERVO = None
+if os.environ.get("ELBERR_NO_SERVO") == "1":
+    # Debug: the Wemos shares the USB hub with the mic and reboots when we
+    # open its serial port, which can disturb the mic's audio endpoint.
+    log("ELBERR", "servo link disabled (ELBERR_NO_SERVO=1).")
+else:
+    SERVO = _servo_connect()
 
 
 def _servo_cmd(joints, reply):
@@ -664,39 +744,22 @@ def main():
     ears = Ears()
     armed = False           # wake heard -> capturing a command
     silence = 0            # chunks of silence while armed
-    chunk_bytes = RATE * 2 * 2 // 5  # 0.2s stereo S16
+    # capture runs in its own thread so STT can never overrun the ALSA buffer
+    cap = threading.Thread(target=_capture_loop, daemon=True)
+    cap.start()
     while True:
         try:
-            if dead_streak >= 3:
-                # Mic endpoint wedged. The persistent stream normally survives
-                # for hours; a hub re-enumeration is the last-resort heal
-                # (max once per 5 min), else back off quietly.
-                if time.time() - last_reset > 300:
-                    last_reset = time.time()
-                    log("ELBERR", "mic dead, resetting USB audio.")
-                    _reset_mic()
-                    set_mood("listening")
-                else:
-                    log("ELBERR", "mic dead, backing off 60s.")
-                    set_mood("sleep")
-                    time.sleep(60)
-                dead_streak = 0
-                continue
-
             if not armed:
                 set_mood("sleep" if sleeping else "listening")
-            proc = _STREAM or _open_stream()
-            if proc.poll() is not None:
-                proc = _open_stream()
-            raw = _read_exact(proc, chunk_bytes, timeout_s=3.0)
-            if len(raw) < chunk_bytes // 2:
-                dead_streak += 1
-                log("ELBERR", "mic gave no bytes.")
+            # audio comes from the capture thread's queue: this thread may
+            # take its time with STT without overrunning the ALSA buffer.
+            try:
+                raw = _AUDIO_Q.get(timeout=2.0)
+            except queue.Empty:
                 continue
             dead_streak = 0
-            pcm_chunk = raw
-            n = len(pcm_chunk) // 2
-            stereo = struct.unpack(f"<{n}h", pcm_chunk[:n * 2])
+            n = len(raw) // 2
+            stereo = struct.unpack(f"<{n}h", raw[:n * 2])
             mono = struct.pack(f"<{n // 2}h",
                                *[(a + b) // 2 for a, b in
                                  zip(stereo[0::2], stereo[1::2])])
@@ -720,7 +783,6 @@ def main():
             # ---- armed: capturing a command ----
             if kind in ("stable", "final") and text:
                 log("ELBERR", f"mic level rms={level:.0f}.")
-                log("YOU", text)
                 cmd = handle_command(text)
                 if cmd == "sleep":
                     sleeping = True

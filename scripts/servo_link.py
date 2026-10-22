@@ -69,8 +69,18 @@ class ServoLink:
         if not port:
             raise RuntimeError("Wemos (1a86:7523) not found on USB")
         self.port = port
-        self.ser = serial.Serial(port, self.baud, timeout=0.2)
-        time.sleep(reset_wait)  # ESP8266 reboots when the port opens
+        # DTR/RTS must be asserted HIGH (dtr=True, rts=True): on the Wemos
+        # CH340, RTS low pulls EN low and DTR low pulls GPIO0 low, which
+        # RESETS the ESP8266. That reset disturbs the USB hub the camera mic
+        # shares, and the mic's audio endpoint dies ("read error").
+        # Keeping both lines high leaves the board running untouched.
+        self.ser = serial.Serial(port, self.baud, timeout=0.2, dsrdtr=False)
+        try:
+            self.ser.dtr = True
+            self.ser.rts = True
+        except Exception:
+            pass
+        time.sleep(0.3)  # board is already running: no reboot to wait for
         self.ser.reset_input_buffer()
         self.enabled = False
         self._stop.clear()
