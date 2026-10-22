@@ -581,6 +581,14 @@ def handle_command(text):
             log("ELBERR", "e-stop sent to servo bridge.")
         speak("Stopping.")
         return True
+    if any(k in t for k in ("resume", "clear the emergency stop", "reset the stop",
+                            "start moving again")):
+        if SERVO is not None:
+            SERVO.reset()
+            SERVO.enable()
+            log("ELBERR", "e-stop cleared, bridge re-enabled.")
+        speak("Moving again.")
+        return True
     if any(k in t for k in ("nod", "shake your head", "say no")):
         if SERVO is not None:
             for i in range(3):
