@@ -93,6 +93,7 @@ _AUDIO_Q = queue.Queue(maxsize=25)   # ~5 s of audio, newest wins
                                     # (small on purpose: the STT must keep
                                     #  up with real time or latency grows)
 _lag_samples = []
+_stats = {"peak": 0.0}   # mutable: no `global` needed to update
 _reopen_failures = 0
 CHUNK_BYTES = RATE * 2 // 5        # 0.2 s mono S16
 
@@ -270,7 +271,8 @@ def _reset_mic():
 # it, so a wake phrase like "hey elberr" cannot work). Keep plain English.
 # Override with ELBERR_WAKE="hey dude,hey man".
 WAKE_PHRASES = [p.strip() for p in os.environ.get(
-    "ELBERR_WAKE", "hey dude,hey man,hey buddy").split(",") if p.strip()]
+    "ELBERR_WAKE", "hey dude,hey man,hey buddy,hey,hello elberr").split(",")
+    if p.strip()]
 # Set ELBERR_NO_WAKE=1 to disable wake gating (always listening).
 NO_WAKE = os.environ.get("ELBERR_NO_WAKE", "") == "1"
 # Chunks (0.2s each) the STT partial must stay identical before we treat the
@@ -279,6 +281,40 @@ STABLE_CHUNKS = 3
 CHUNK_S = 0.2
 SILENCE_CHUNKS_TO_ABANDON = 60  # 12 s of silence after wake -> give up
                                 # (the human needs time to speak the command)
+
+
+def _wake_match(text):
+    """True if the STT output starts one of the wake phrases.
+
+    Vosk's grammar recogniser returns partial matches ("hey" while the
+    speaker is still saying "hey dude"), so we accept any word-prefix of
+    a wake phrase rather than the complete phrase.
+    """
+    words = text.lower().split()
+    if not words:
+        return False
+    for phrase in WAKE_PHRASES:
+        pw = phrase.split()
+        if len(words) <= len(pw) and pw[:len(words)] == words:
+            return True
+    return False
+
+
+def _wake_match(text):
+    """True if the STT output starts one of the wake phrases.
+
+    Vosk's grammar recogniser returns partial matches ("hey" while the
+    speaker is still saying "hey dude"), so we accept any word-prefix of
+    a wake phrase rather than requiring the complete phrase.
+    """
+    words = text.lower().split()
+    if not words:
+        return False
+    for phrase in WAKE_PHRASES:
+        pw = phrase.split()
+        if len(words) <= len(pw) and pw[:len(words)] == words:
+            return True
+    return False
 
 
 class Ears:
@@ -317,18 +353,25 @@ class Ears:
         # The cut-off adapts to the room: this mic's noise floor is ~125
         # while speech is 330+, and a quiet voice can be ~190, so a fixed
         # threshold is not safe across mics and rooms.
-        self.speech_level = 90
+        self.speech_level = 70
         self.noise_floor = 120.0
+        self.gate = 100.0
         self.loud_chunks = 0
         self.silent_chunks = 0
 
     def _update_noise(self, level):
-        """Slow-moving noise floor estimate (fast down, slow up)."""
+        """Slow-moving noise floor estimate (fast down, slow up).
+
+        The gate is the floor plus a small margin: this mic's noise floor
+        is ~78 rms and a normal voice is 130-190, so a multiplicative
+        margin (noise*1.45) would cut most of the speech away.
+        """
         if level < self.noise_floor:
             self.noise_floor = level          # new minimum: track instantly
         else:
             self.noise_floor += (level - self.noise_floor) * 0.01
-        return max(self.speech_level, self.noise_floor * 1.45)
+        self.gate = max(self.speech_level, self.noise_floor + 25.0)
+        return self.gate
 
     def reset_cmd(self):
         self.rec_cmd.Reset()
@@ -374,7 +417,7 @@ class Ears:
 
         if not NO_WAKE and not armed:
             w = json.loads(self.rec_wake.PartialResult()).get("partial", "")
-            if len(w.split()) >= 2:
+            if _wake_match(w):
                 # Reset the wake recogniser, otherwise it keeps re-matching
                 # the phrase in its buffer and every later chunk is
                 # classified "wake" (the command would never be heard).
@@ -410,13 +453,13 @@ def _capture_loop():
     """Owns the microphone.
 
     Opens a capture window, drains it into _AUDIO_Q as fast as the device
-    delivers, and re-enumerates the USB device when the window ends (this
-    camera mic only survives one open per enumeration). This thread must
-    never block on STT - that is the whole point of the queue.
+    delivers, and reopens (or re-enumerates) when the window ends. This
+    thread must never block on STT - that is the whole point of the queue.
     """
+    global _reopen_failures
     while not _STOP.is_set():
-        proc = _open_stream()
         try:
+            proc = _open_stream()
             while not _STOP.is_set() and proc.poll() is None:
                 raw = _read_exact(proc, CHUNK_BYTES, timeout_s=2.0)
                 if not raw:
@@ -442,7 +485,10 @@ def _capture_loop():
         log("ELBERR", "mic window ended, reopening.")
         # The current mic streams continuously, so a plain reopen is enough.
         # Only if that keeps failing do we re-enumerate the USB device.
-        _reopen_failures += 1
+        try:
+            _reopen_failures += 1
+        except Exception:
+            pass
         if _reopen_failures >= 3:
             _reopen_failures = 0
             log("ELBERR", "mic stream keeps dying, re-enumerating USB audio.")
@@ -955,12 +1001,6 @@ def main():
                 ts, raw = _AUDIO_Q.get(timeout=2.0)
             except queue.Empty:
                 continue
-            lag = time.time() - ts
-            _lag_samples.append(lag)
-            if len(_lag_samples) >= 25:
-                avg = sum(_lag_samples) / len(_lag_samples)
-                log("ELBERR", f"pipeline lag avg={avg:.1f}s queue={_AUDIO_Q.qsize()}")
-                _lag_samples.clear()
             dead_streak = 0
             # mono capture (the current USB mic is mono)
             n = len(raw) // 2
@@ -971,6 +1011,17 @@ def main():
             samples = _hp_filter(samples)
             mono = struct.pack(f"<{n}h", *[int(max(-32000, min(32000, v)))
                                            for v in samples])
+
+            lag = time.time() - ts
+            _lag_samples.append(lag)
+            _stats["peak"] = max(_stats["peak"], level)
+            if len(_lag_samples) >= 25:
+                avg = sum(_lag_samples) / len(_lag_samples)
+                log("ELBERR", f"pipeline lag avg={avg:.1f}s queue={_AUDIO_Q.qsize()} "
+                             f"peak={_stats['peak']:.0f} level={level:.0f} "
+                             f"gate={ears.gate:.0f} noise={ears.noise_floor:.0f}")
+                _lag_samples.clear()
+                _stats["peak"] = 0.0
 
             kind, text = ears.feed(mono, level, armed=armed)
 
