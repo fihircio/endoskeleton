@@ -17,7 +17,7 @@
 //     {"joints":{"left_neck_pan":1.0,"up_neck_tilt":0.6}}  (radians, ACTIVE only)
 //     PCA9685 channels: left_neck_pan=1, up_neck_tilt=4
 //   Wemos -> Pi (2 Hz status + replies):
-//     {"state":"ACTIVE","positions":{"left_elbow_pitch":1.56,...},"t_ms":12345}
+//     {"state":"ACTIVE","positions":{"left_neck_pan":1.56,...},"t_ms":12345}
 //     {"error":"unknown joint foo"}   (non-fatal, stays ACTIVE)
 //
 // Safety (mirrors spec section 26, scoped to this board):
