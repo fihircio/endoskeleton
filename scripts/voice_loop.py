@@ -321,22 +321,45 @@ PHOTOS = os.path.join(BRAIN, "photos")
 # --- servo link (Wemos bridge over USB serial) ---
 # Neck joint targets in radians. Centre = 1.57 (90 deg servo = centred).
 SERVO = None
-try:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from servo_link import ServoLink
-    SERVO = ServoLink(port=os.environ.get("SERVO_PORT", "/dev/ttyUSB0"))
-    SERVO.connect()
-except Exception as _e:  # servos optional: voice loop still works without
-    SERVO = None
-    print(f"[servo] link unavailable: {_e}", file=sys.stderr)
+
+
+def _servo_connect():
+    """(Re)connect to the Wemos. The ttyUSB number shifts whenever another
+    USB device re-enumerates, so we look the board up by USB ID."""
+    global SERVO
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from servo_link import ServoLink, find_wemos_port
+        port = find_wemos_port()
+        if not port:
+            return None
+        link = ServoLink(port=port)
+        link.connect()
+        log("ELBERR", f"servo link up on {port}.")
+        return link
+    except Exception as e:
+        log("ELBERR", f"servo link unavailable: {e}")
+        return None
+
+
+SERVO = _servo_connect()
 
 
 def _servo_cmd(joints, reply):
     """Send joint targets to the Wemos bridge. Returns True if handled."""
+    global SERVO
+    if SERVO is None:
+        SERVO = _servo_connect()  # try to (re)connect
     if SERVO is None:
         speak("My neck is offline right now.")
         return True
-    SERVO.set(joints)
+    try:
+        SERVO.set(joints)
+    except Exception as e:
+        log("ELBERR", f"servo send failed: {e}")
+        SERVO = None
+        speak("My neck stopped listening.")
+        return True
     speak(reply)
     return True
 

@@ -11,7 +11,9 @@ bridge's command timeout never expires mid-gesture.
   link.set({"left_neck_pan": 0.9})     # look left
   link.estop()                          # kill outputs (latched on the bridge)
 """
+import glob
 import json
+import os
 import threading
 import time
 
@@ -19,6 +21,27 @@ try:
     import serial
 except ImportError:  # pragma: no cover
     serial = None
+
+# Wemos D1 R2 = CH340 (VID 1a86, PID 7523). We look it up by USB ID because
+# the ttyUSB number shifts whenever another USB device re-enumerates (e.g.
+# the camera mic being reset).
+WEMOS_VID = "1a86"
+WEMOS_PID = "7523"
+
+
+def find_wemos_port():
+    """Return /dev/ttyUSB* for the Wemos, or None."""
+    for tty in sorted(glob.glob("/sys/class/tty/ttyUSB*")):
+        try:
+            iface = os.path.dirname(os.path.realpath(os.path.join(tty, "device")))
+            parent = os.path.dirname(iface)
+            vid = open(os.path.join(parent, "idVendor")).read().strip()
+            pid = open(os.path.join(parent, "idProduct")).read().strip()
+        except OSError:
+            continue
+        if vid.lower() == WEMOS_VID and pid.lower() == WEMOS_PID:
+            return "/dev/" + os.path.basename(tty)
+    return None
 
 
 class ServoLink:
@@ -38,7 +61,15 @@ class ServoLink:
     def connect(self, reset_wait=2.0):
         if serial is None:
             raise RuntimeError("python3-serial not installed")
-        self.ser = serial.Serial(self.port, self.baud, timeout=0.2)
+        port = self.port or find_wemos_port()
+        if port and not os.path.exists(port):
+            found = find_wemos_port()
+            if found:
+                port = found
+        if not port:
+            raise RuntimeError("Wemos (1a86:7523) not found on USB")
+        self.port = port
+        self.ser = serial.Serial(port, self.baud, timeout=0.2)
         time.sleep(reset_wait)  # ESP8266 reboots when the port opens
         self.ser.reset_input_buffer()
         self.enabled = False
