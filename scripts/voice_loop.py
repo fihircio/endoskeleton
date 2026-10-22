@@ -14,6 +14,7 @@ Files (all under ~/brain): models/qwen25-05b-q4km.gguf,
 import argparse
 import datetime
 import json
+import math
 import os
 import queue
 import struct
@@ -30,7 +31,8 @@ LLAMA = os.path.join(HOME, ".llama-app", "llama")
 MOOD_FILE = "/tmp/face_mood"
 LOG = os.path.join(BRAIN, "chats.log")
 
-MIC = "hw:CARD=PSE0510"  # Philips camera mic, by name (card numbers move)
+MIC = os.environ.get("MIC", "hw:CARD=Device")  # USB mic (resolved by VID/PID
+                                               # at startup - see find_mic_card)
 SPK = "plughw:CARD=DS09"  # USB speaker via plug (mono/stereo + rate convert)
 RATE = 16000
 LISTEN_S = 6
@@ -91,23 +93,107 @@ _AUDIO_Q = queue.Queue(maxsize=25)   # ~5 s of audio, newest wins
                                     # (small on purpose: the STT must keep
                                     #  up with real time or latency grows)
 _lag_samples = []
-CHUNK_BYTES = RATE * 2 * 2 // 5      # 0.2 s stereo S16
+_reopen_failures = 0
+CHUNK_BYTES = RATE * 2 // 5        # 0.2 s mono S16
 
 
-def _set_mic_gain(pct=70):
+MIC_VID, MIC_PID = "08bb", "2902"   # TI PCM2902 USB mic (C-Media PnP)
+
+
+def find_mic_card(vid=MIC_VID, pid=MIC_PID):
+    """Find the ALSA card name of the USB mic by USB VID/PID.
+
+    The card index moves whenever another USB device re-enumerates, so we
+    resolve it by identity instead of hard-coding 'hw:0,4'.
+    """
+    import glob
+    for card in glob.glob("/sys/class/sound/card*"):
+        try:
+            name = open(os.path.join(card, "id")).read().strip()
+            dev = os.path.realpath(os.path.join(card, "device"))
+            # walk up to the USB device node that carries idVendor
+            node = dev
+            for _ in range(6):
+                node = os.path.dirname(node)
+                vfile = os.path.join(node, "idVendor")
+                pfile = os.path.join(node, "idProduct")
+                if os.path.exists(vfile) and os.path.exists(pfile):
+                    v = open(vfile).read().strip().lower()
+                    p = open(pfile).read().strip().lower()
+                    if v == vid.lower() and p == pid.lower():
+                        return f"hw:CARD={name}"
+                    break
+        except OSError:
+            continue
+    return None
+
+
+_HPF_STATE = None
+
+
+def _hp_filter(samples):
+    """2nd-order Butterworth high-pass (250 Hz) + peak-safe normalisation.
+
+    The USB mic has a big low-frequency noise floor (DC + 20-50 Hz rumble)
+    that masks speech. Removing it lifts the SNR before STT; the result is
+    then scaled to a healthy level so Vosk always gets a good input.
+    """
+    global _HPF_STATE
+    fc, fs, Q = 250.0, 16000.0, 0.7071
+    w0 = 2 * math.pi * fc / fs
+    alpha = math.sin(w0) / (2 * Q)
+    c = math.cos(w0)
+    a0 = 1 + alpha
+    b0, b1, b2 = ((1 + c) / 2) / a0, (-(1 + c)) / a0, ((1 + c) / 2) / a0
+    a1, a2 = (-2 * c) / a0, (1 - alpha) / a0
+    x1 = x2 = y1 = y2 = 0.0
+    if _HPF_STATE:
+        x1, x2, y1, y2 = _HPF_STATE
+    out = []
+    for x in samples:
+        y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2, x1 = x1, x
+        y2, y1 = y1, y
+        out.append(y)
+    _HPF_STATE = (x1, x2, y1, y2)
+    peak = max((abs(v) for v in out), default=1.0)
+    if peak > 1.0:
+        g = min(6.0, 8000.0 / peak)   # up to +15 dB, no clipping
+        out = [v * g for v in out]
+    return out
+
+
+def _mic_device_path(vid=MIC_VID, pid=MIC_PID):
+    """USB device path of the mic (e.g. 1-1.3) for reset purposes."""
+    import glob
+    for vfile in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+        try:
+            if open(vfile).read().strip().lower() == vid.lower():
+                node = os.path.dirname(vfile)
+                if open(os.path.join(node, "idProduct")).read().strip().lower() == pid.lower():
+                    return os.path.basename(node)
+        except OSError:
+            continue
+    return None
+
+
+def _set_mic_gain(pct=None):
     """Set the mic capture level. USB re-enumeration restores the 95%
     default (clipping), so this runs at startup and after every reset."""
     try:
         card = ""
         with open("/proc/asound/cards") as f:
             for line in f:
-                if "PSE0510" in line:
+                if "USB PnP" in line or "PSE0510" in line:
                     card = line.split()[0].rstrip(":")
                     break
-        if card:
-            subprocess.run(["amixer", "-c", card, "set", "Mic", f"{pct}%"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=10)
+        if not card:
+            return
+        if pct is None:
+            pct = 70
+        subprocess.run(["amixer", "-c", card, "set", "Mic", f"{pct}%"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10)
     except Exception:
         pass
 
@@ -115,16 +201,17 @@ def _set_mic_gain(pct=70):
 def _open_stream():
     """Open a capture window on the mic.
 
-    NOTE on this Philips PSE0510: the device dies on close/reopen, so the
-    window is a long-ish single arecord (-d 60) that we read progressively,
-    and the device is re-enumerated between windows (see _reset_mic).
+    The current USB mic (TI PCM2902) streams continuously and happily, so
+    this is one long arecord that we read progressively. The old Philips
+    camera-mic died on reopen, which is why the code still knows how to
+    re-enumerate a USB audio device - now only as a fallback.
     """
     global _STREAM
     _close_stream()
     err = open("/tmp/arecord_err.log", "ab")
     _STREAM = subprocess.Popen(
         ["arecord", "-q", "-D", MIC, "-f", "S16_LE", "-r", str(RATE),
-         "-c", "2", "-d", "60", "-t", "raw"],
+         "-c", "1", "-d", "3600", "-t", "raw"],
         stdout=subprocess.PIPE, stderr=err)
     return _STREAM
 
@@ -160,19 +247,22 @@ def _read_exact(proc, nbytes, timeout_s=LISTEN_S + 8):
 
 
 def _reset_mic():
-    """Re-enumerate the USB mic device. This camera mic only survives one
-    open per enumeration, so the device must be re-bound between windows.
-    The stream must be released BEFORE the unbind, or the unbind fails."""
+    """Re-enumerate the USB mic device (fallback for wedged USB audio).
+
+    The current mic streams fine, so this is only used if the stream keeps
+    dying. The device must be released before the unbind, or it fails.
+    """
     _close_stream()
     time.sleep(0.5)
+    dev = _mic_device_path() or "auto"
     try:
-        p = subprocess.run(["sudo", "-n", "/usr/local/bin/usb-audio-reset", "auto"],
-                           capture_output=True, text=True, timeout=60)
+        p = subprocess.run(["sudo", "-n", "/usr/local/bin/usb-audio-reset", dev],
+                           capture_output=True, text=True, timeout=90)
         log("ELBERR", f"mic reset: rc={p.returncode} "
                       f"{(p.stdout or '').strip()} {(p.stderr or '').strip()}")
     except Exception as e:
         log("ELBERR", f"mic reset failed: {e}")
-    time.sleep(3)
+    time.sleep(2)
 
 
 # Wake phrases. IMPORTANT: every word must exist in the Vosk model's
@@ -224,12 +314,21 @@ class Ears:
         # Vosk-small decodes at ~75% of real time on this Pi, so decoding
         # silence would build an ever-growing backlog (and delay every
         # reply). We only feed the recognisers when there is speech.
-        # Measured on this mic: room tone rms 28-50, a quiet human voice at
-        # desk distance ~140, the speaker next to the mic 537-4000. The
-        # threshold must sit above the noise floor but BELOW a normal voice.
+        # The cut-off adapts to the room: this mic's noise floor is ~125
+        # while speech is 330+, and a quiet voice can be ~190, so a fixed
+        # threshold is not safe across mics and rooms.
         self.speech_level = 90
+        self.noise_floor = 120.0
         self.loud_chunks = 0
         self.silent_chunks = 0
+
+    def _update_noise(self, level):
+        """Slow-moving noise floor estimate (fast down, slow up)."""
+        if level < self.noise_floor:
+            self.noise_floor = level          # new minimum: track instantly
+        else:
+            self.noise_floor += (level - self.noise_floor) * 0.01
+        return max(self.speech_level, self.noise_floor * 1.45)
 
     def reset_cmd(self):
         self.rec_cmd.Reset()
@@ -248,7 +347,8 @@ class Ears:
               None     -> nothing yet
         """
         # ---- VAD gate: skip decoding silence ----
-        if level >= self.speech_level:
+        gate = self._update_noise(level)
+        if level >= gate:
             self.loud_chunks += 1
             self.silent_chunks = 0
         else:
@@ -339,9 +439,15 @@ def _capture_loop():
             _close_stream()
         if _STOP.is_set():
             break
-        log("ELBERR", "mic window ended, re-enumerating.")
-        _reset_mic()
-        time.sleep(2)  # back off: the USB stack needs a moment between resets
+        log("ELBERR", "mic window ended, reopening.")
+        # The current mic streams continuously, so a plain reopen is enough.
+        # Only if that keeps failing do we re-enumerate the USB device.
+        _reopen_failures += 1
+        if _reopen_failures >= 3:
+            _reopen_failures = 0
+            log("ELBERR", "mic stream keeps dying, re-enumerating USB audio.")
+            _reset_mic()
+        time.sleep(1)
 
 
 def _cleanup(signum=None, frame=None):
@@ -824,8 +930,15 @@ def main():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     _set_mic_gain()
     _signal.signal(_signal.SIGTERM, _cleanup)
-    last_speech, sleeping = time.time(), False
+    global MIC, _reopen_failures
+    found = find_mic_card()
+    if found:
+        MIC = found
+        log("ELBERR", f"mic card resolved: {MIC}")
+    else:
+        log("ELBERR", f"mic card not found by VID/PID, using {MIC}")
     dead_streak, last_reset = 0, 0.0
+    last_speech, sleeping = time.time(), False
     ears = Ears()
     armed = False           # wake heard -> capturing a command
     silence = 0            # chunks of silence while armed
@@ -849,12 +962,15 @@ def main():
                 log("ELBERR", f"pipeline lag avg={avg:.1f}s queue={_AUDIO_Q.qsize()}")
                 _lag_samples.clear()
             dead_streak = 0
+            # mono capture (the current USB mic is mono)
             n = len(raw) // 2
-            stereo = struct.unpack(f"<{n}h", raw[:n * 2])
-            mono = struct.pack(f"<{n // 2}h",
-                               *[(a + b) // 2 for a, b in
-                                 zip(stereo[0::2], stereo[1::2])])
-            level = _rms(struct.unpack(f"<{n // 2}h", mono))
+            samples = struct.unpack(f"<{n}h", raw[:n * 2])
+            level = _rms(samples)
+            # high-pass + normalise: removes the mic's DC/rumble floor that
+            # otherwise masks speech from the recogniser
+            samples = _hp_filter(samples)
+            mono = struct.pack(f"<{n}h", *[int(max(-32000, min(32000, v)))
+                                           for v in samples])
 
             kind, text = ears.feed(mono, level, armed=armed)
 
