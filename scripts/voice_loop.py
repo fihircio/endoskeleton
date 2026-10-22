@@ -389,30 +389,21 @@ class Ears:
               'final'  -> recognizer finalised a phrase
               None     -> nothing yet
         """
-        # ---- VAD gate: skip decoding silence ----
-        gate = self._update_noise(level)
-        if level >= gate:
-            self.loud_chunks += 1
-            self.silent_chunks = 0
+        # The audio is ALWAYS fed to the recogniser: skipping silence breaks
+        # the stream and the recogniser can never complete a phrase. Measured
+        # on this Pi the grammar recogniser runs at ~9x real time, so there
+        # is plenty of headroom for continuous decoding.
+        #
+        # Only ONE recogniser runs at a time:
+        #   waiting for the wake -> only the (cheaper) grammar recogniser
+        #   armed (capturing a command) -> only the free-form recogniser
+        if armed:
+            self.rec_cmd.AcceptWaveform(pcm)
         else:
-            self.silent_chunks += 1
-            if self.silent_chunks > 6:  # 1.2 s of quiet
-                if self.loud_chunks:
-                    # end of an utterance -> finalise and reset
-                    self.loud_chunks = 0
-                    final = json.loads(self.rec_cmd.Result()).get("text", "").strip()
-                    self.rec_cmd.Reset()
-                    self.rec_wake.Reset()
-                    self.since_flush = 0.0
-                    if final:
-                        return ("final", final)
-                return (None, "")
-
-        self.rec_cmd.AcceptWaveform(pcm)
-        if not armed:
             self.rec_wake.AcceptWaveform(pcm)
         self.since_flush += self.chunk_s
-        quiet = level < 600
+        gate = self._update_noise(level)
+        quiet = level < gate            # adaptive, not an absolute level
         overdue = self.since_flush > self.max_utterance_s
 
         if not NO_WAKE and not armed:
@@ -422,11 +413,19 @@ class Ears:
                 # the phrase in its buffer and every later chunk is
                 # classified "wake" (the command would never be heard).
                 self.rec_wake.Reset()
+                self.rec_cmd.Reset()
                 return ("wake", w.strip())
             if quiet or overdue:
-                json.loads(self.rec_wake.Result())
+                # Vosk emits the COMPLETED phrase in Result(), not in the
+                # partials - so the final result has to be checked too.
+                wf = json.loads(self.rec_wake.Result()).get("text", "").strip()
+                if _wake_match(wf):
+                    self.rec_wake.Reset()
+                    self.rec_cmd.Reset()
+                    return ("wake", wf)
                 if quiet:
                     self.since_flush = 0.0
+            return (None, w.strip())
         p = json.loads(self.rec_cmd.PartialResult()).get("partial", "")
         if p.strip():
             if p == self.last_partial:
@@ -1005,10 +1004,12 @@ def main():
             # mono capture (the current USB mic is mono)
             n = len(raw) // 2
             samples = struct.unpack(f"<{n}h", raw[:n * 2])
-            level = _rms(samples)
-            # high-pass + normalise: removes the mic's DC/rumble floor that
-            # otherwise masks speech from the recogniser
+            # High-pass FIRST: the mic has a big DC + 50 Hz hum floor, and
+            # measuring the level on the raw signal hides every quiet
+            # speech peak (the level never looks like "silence", so the
+            # recogniser is never asked to finalise and no wake is emitted).
             samples = _hp_filter(samples)
+            level = _rms(samples)
             mono = struct.pack(f"<{n}h", *[int(max(-32000, min(32000, v)))
                                            for v in samples])
 
