@@ -318,6 +318,29 @@ PLACE_LAT, PLACE_LON = 3.1390, 101.6869
 PLACE_TZ = "Asia/Kuala_Lumpur"
 PHOTOS = os.path.join(BRAIN, "photos")
 
+# --- servo link (Wemos bridge over USB serial) ---
+# Neck joint targets in radians. Centre = 1.57 (90 deg servo = centred).
+SERVO = None
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from servo_link import ServoLink
+    SERVO = ServoLink(port=os.environ.get("SERVO_PORT", "/dev/ttyUSB0"))
+    SERVO.connect()
+except Exception as _e:  # servos optional: voice loop still works without
+    SERVO = None
+    print(f"[servo] link unavailable: {_e}", file=sys.stderr)
+
+
+def _servo_cmd(joints, reply):
+    """Send joint targets to the Wemos bridge. Returns True if handled."""
+    if SERVO is None:
+        speak("My neck is offline right now.")
+        return True
+    SERVO.set(joints)
+    speak(reply)
+    return True
+
+
 
 def _sys_status():
     import re as _re
@@ -487,9 +510,10 @@ def handle_command(text):
         return True
     if any(k in t for k in ("help", "what can you do")):
         set_mood("happy")
-        help_text = ("Try: take a photo. Look happy, surprised, angry, tired, "
-                     "curious, or sleepy. Laugh. Look confused. Status. "
-                     "What time is it. Go to sleep. Wake up. Or just talk.")
+        help_text = ("Try: take a photo. Look left, right, up, down, or straight "
+                     "ahead. Nod. Stop. Look happy, surprised, angry, tired, "
+                     "curious, or sleepy. Status. What time is it. Go to sleep. "
+                     "Wake up. Or just talk.")
         log("ELBERR", help_text)
         speak(help_text)
         set_mood("normal")
@@ -514,8 +538,36 @@ def handle_command(text):
         speak(ans)
         set_mood("normal")
         return True
-    for mood, keys, line in [
-        ("happy", ("look happy", "be happy", "smile", "seem happy"), "Yay!"),
+    # --- neck / servo commands (deterministic; the LLM never drives motors) ---
+    if any(k in t for k in ("look left", "turn left", "look to the left")):
+        return _servo_cmd({"left_neck_pan": 0.90}, "Looking left.")
+    if any(k in t for k in ("look right", "turn right", "look to the right")):
+        return _servo_cmd({"left_neck_pan": 2.20}, "Looking right.")
+    if any(k in t for k in ("look up", "look up at the sky", "tilt up")):
+        return _servo_cmd({"up_neck_tilt": 2.10}, "Looking up.")
+    if any(k in t for k in ("look down", "tilt down", "look at the floor")):
+        return _servo_cmd({"up_neck_tilt": 0.90}, "Looking down.")
+    if any(k in t for k in ("look straight", "look ahead", "face forward",
+                            "center your head", "look at me")):
+        return _servo_cmd({"left_neck_pan": 1.57, "up_neck_tilt": 1.57},
+                          "Looking straight ahead.")
+    if any(k in t for k in ("emergency stop", "stop everything", "stop moving",
+                            "freeze", "halt")):
+        if SERVO is not None:
+            SERVO.estop()
+            log("ELBERR", "e-stop sent to servo bridge.")
+        speak("Stopping.")
+        return True
+    if any(k in t for k in ("nod", "shake your head", "say no")):
+        if SERVO is not None:
+            for i in range(3):
+                SERVO.set({"up_neck_tilt": 1.35 if i % 2 == 0 else 1.75})
+                time.sleep(0.18)
+            SERVO.set({"up_neck_tilt": 1.57})
+        speak("No no no.")
+        return True
+
+    for mood, keys, line in [        ("happy", ("look happy", "be happy", "smile", "seem happy"), "Yay!"),
         ("surprised", ("look surprised", "be surprised", "surprise me"), "Whoa!"),
         ("angry", ("look angry", "be angry", "act angry", "get angry"), "Grr."),
         ("tired", ("look tired", "be tired", "act tired"), "So sleepy."),
