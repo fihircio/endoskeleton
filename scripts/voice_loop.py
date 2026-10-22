@@ -87,7 +87,10 @@ _STOP = threading.Event()
 # main thread does the STT. Without this split, Vosk's per-chunk decoding
 # (which can take longer than real time) makes ALSA overrun the capture
 # buffer -> "overrun!!!" -> the mic stream dies.
-_AUDIO_Q = queue.Queue(maxsize=60)   # ~12 s of audio, newest wins
+_AUDIO_Q = queue.Queue(maxsize=25)   # ~5 s of audio, newest wins
+                                    # (small on purpose: the STT must keep
+                                    #  up with real time or latency grows)
+_lag_samples = []
 CHUNK_BYTES = RATE * 2 * 2 // 5      # 0.2 s stereo S16
 
 
@@ -213,19 +216,28 @@ class Ears:
         self.stable = 0
         self.since_flush = 0.0
         self.chunk_s = 0.2
-        # A recognizer that never finalises grows an unbounded lattice and
+        # A recogniser that never finalises grows an unbounded lattice and
         # eventually spends MINUTES in lattice determinisation (Vosk warns
         # "size exceeds maximum 50000000 bytes"). We therefore force a
         # flush if an utterance has been open for this long.
         self.max_utterance_s = 8.0
+        # Vosk-small decodes at ~75% of real time on this Pi, so decoding
+        # silence would build an ever-growing backlog (and delay every
+        # reply). We only feed the recognisers when there is speech.
+        # Measured on this mic: speech rms 537-4000, room tone 28-50.
+        self.speech_level = 250
+        self.loud_chunks = 0
+        self.silent_chunks = 0
 
     def reset_cmd(self):
         self.rec_cmd.Reset()
         self.last_partial = ""
         self.stable = 0
         self.since_flush = 0.0
+        self.loud_chunks = 0
+        self.silent_chunks = 0
 
-    def feed(self, pcm, level):
+    def feed(self, pcm, level, armed=False):
         """Feed one chunk. Returns (kind, text).
 
         kind: 'wake'   -> wake phrase spotted
@@ -233,13 +245,32 @@ class Ears:
               'final'  -> recognizer finalised a phrase
               None     -> nothing yet
         """
-        self.rec_wake.AcceptWaveform(pcm)
+        # ---- VAD gate: skip decoding silence ----
+        if level >= self.speech_level:
+            self.loud_chunks += 1
+            self.silent_chunks = 0
+        else:
+            self.silent_chunks += 1
+            if self.silent_chunks > 6:  # 1.2 s of quiet
+                if self.loud_chunks:
+                    # end of an utterance -> finalise and reset
+                    self.loud_chunks = 0
+                    final = json.loads(self.rec_cmd.Result()).get("text", "").strip()
+                    self.rec_cmd.Reset()
+                    self.rec_wake.Reset()
+                    self.since_flush = 0.0
+                    if final:
+                        return ("final", final)
+                return (None, "")
+
         self.rec_cmd.AcceptWaveform(pcm)
+        if not armed:
+            self.rec_wake.AcceptWaveform(pcm)
         self.since_flush += self.chunk_s
         quiet = level < 600
         overdue = self.since_flush > self.max_utterance_s
 
-        if not NO_WAKE:
+        if not NO_WAKE and not armed:
             w = json.loads(self.rec_wake.PartialResult()).get("partial", "")
             if len(w.split()) >= 2:
                 # Reset the wake recogniser, otherwise it keeps re-matching
@@ -258,7 +289,9 @@ class Ears:
             else:
                 self.stable = 0
                 self.last_partial = p
-            if self.stable >= STABLE_CHUNKS:
+            if self.stable >= STABLE_CHUNKS and len(p.split()) >= 2:
+                # only fire the early trigger on a multi-word partial: a
+                # one-word partial is usually a fragment of a longer phrase
                 return ("stable", p.strip())
             return (None, p.strip())
         if quiet or overdue:
@@ -287,7 +320,7 @@ def _capture_loop():
                 if not raw:
                     continue
                 try:
-                    _AUDIO_Q.put_nowait(raw)
+                    _AUDIO_Q.put_nowait((time.time(), raw))
                 except queue.Full:
                     # keep the freshest audio: drop the oldest
                     try:
@@ -295,7 +328,7 @@ def _capture_loop():
                     except queue.Empty:
                         pass
                     try:
-                        _AUDIO_Q.put_nowait(raw)
+                        _AUDIO_Q.put_nowait((time.time(), raw))
                     except queue.Full:
                         pass
         except Exception as e:
@@ -306,6 +339,7 @@ def _capture_loop():
             break
         log("ELBERR", "mic window ended, re-enumerating.")
         _reset_mic()
+        time.sleep(2)  # back off: the USB stack needs a moment between resets
 
 
 def _cleanup(signum=None, frame=None):
@@ -380,6 +414,25 @@ def round_trip(user_text):
     return reply
 
 
+def _drop_stale_audio():
+    """Discard queued audio.
+
+    The reply (LLM + TTS) blocks the main thread, so the capture thread
+    keeps queueing audio while we speak. That backlog is stale (and mostly
+    the robot's own voice leaking into the mic), so it is dropped instead
+    of being decoded later - otherwise the next command is transcribed from
+    misaligned audio and the response drifts further behind.
+    """
+    dropped = 0
+    while True:
+        try:
+            _AUDIO_Q.get_nowait()
+            dropped += 1
+        except queue.Empty:
+            break
+    return dropped
+
+
 # --- structured commands: deterministic intents the tiny LLM must never
 # improvise (spec section 47: the control layer owns the vocabulary, the
 # model only chats). Keyword fast-path; everything else falls to chat. ---
@@ -423,6 +476,37 @@ if os.environ.get("ELBERR_NO_SERVO") == "1":
     log("ELBERR", "servo link disabled (ELBERR_NO_SERVO=1).")
 else:
     SERVO = _servo_connect()
+
+
+def _fuzzy_has(text, keywords, cutoff=0.85):
+    """True if any keyword appears in the text (exact or near-exact).
+
+    Small STT models produce systematic mishearings, so the keyword lists
+    carry the known phonetic variants ("look left" -> "lord let", "luck
+    left", ...). The fuzzy pass is only for typos, hence the high cutoff.
+    """
+    import difflib
+    words = text.split()
+    for kw in keywords:
+        if kw in text:
+            return True
+        target = kw.split()
+        for i in range(len(words) - len(target) + 1):
+            window = " ".join(words[i:i + len(target)])
+            if difflib.SequenceMatcher(None, window, kw).ratio() >= cutoff:
+                return True
+    return False
+
+
+# Known mishearings of the neck commands (Vosk small model).
+NECK_LEFT = ["look left", "lord let", "luck left", "look lat",
+             "turn left", "turn loft", "go left"]
+NECK_RIGHT = ["look right", "lord right", "look write", "look rite",
+              "turn right", "go right"]
+NECK_UP = ["look up", "look of", "look above", "tilt up", "go up"]
+NECK_DOWN = ["look down", "look town", "tilt down", "go down"]
+NECK_FWD = ["look at me", "look straight ahead", "face forward",
+            "center your head", "look ahead", "look forward", "come forward"]
 
 
 def _servo_cmd(joints, reply):
@@ -644,18 +728,17 @@ def handle_command(text):
     # --- neck / servo commands (deterministic; the LLM never drives motors) ---
     # left_neck_pan is a 360 (continuous) servo: the bridge dead-reckons the
     # angle and contains it to 0-180 deg, so these are position targets.
-    if any(k in t for k in ("look left", "turn left", "look to the left")):
-        return _servo_cmd({"left_neck_pan": 0.60}, "Looking left.")
-    if any(k in t for k in ("look right", "turn right", "look to the right")):
-        return _servo_cmd({"left_neck_pan": 2.50}, "Looking right.")
-    if any(k in t for k in ("look up", "look up at the sky", "tilt up")):
-        return _servo_cmd({"up_neck_tilt": 2.10}, "Looking up.")
-    if any(k in t for k in ("look down", "tilt down", "look at the floor")):
-        return _servo_cmd({"up_neck_tilt": 0.90}, "Looking down.")
-    if any(k in t for k in ("look straight", "look ahead", "face forward",
-                            "center your head", "look at me")):
+    if _fuzzy_has(t, NECK_FWD):
         return _servo_cmd({"left_neck_pan": 1.57, "up_neck_tilt": 1.57},
                           "Looking straight ahead.")
+    if _fuzzy_has(t, NECK_LEFT):
+        return _servo_cmd({"left_neck_pan": 0.60}, "Looking left.")
+    if _fuzzy_has(t, NECK_RIGHT):
+        return _servo_cmd({"left_neck_pan": 2.50}, "Looking right.")
+    if _fuzzy_has(t, NECK_UP):
+        return _servo_cmd({"up_neck_tilt": 2.10}, "Looking up.")
+    if _fuzzy_has(t, NECK_DOWN):
+        return _servo_cmd({"up_neck_tilt": 0.90}, "Looking down.")
     if any(k in t for k in ("emergency stop", "stop everything", "stop moving",
                             "freeze", "halt")):
         if SERVO is not None:
@@ -754,9 +837,15 @@ def main():
             # audio comes from the capture thread's queue: this thread may
             # take its time with STT without overrunning the ALSA buffer.
             try:
-                raw = _AUDIO_Q.get(timeout=2.0)
+                ts, raw = _AUDIO_Q.get(timeout=2.0)
             except queue.Empty:
                 continue
+            lag = time.time() - ts
+            _lag_samples.append(lag)
+            if len(_lag_samples) >= 25:
+                avg = sum(_lag_samples) / len(_lag_samples)
+                log("ELBERR", f"pipeline lag avg={avg:.1f}s queue={_AUDIO_Q.qsize()}")
+                _lag_samples.clear()
             dead_streak = 0
             n = len(raw) // 2
             stereo = struct.unpack(f"<{n}h", raw[:n * 2])
@@ -765,7 +854,7 @@ def main():
                                  zip(stereo[0::2], stereo[1::2])])
             level = _rms(struct.unpack(f"<{n // 2}h", mono))
 
-            kind, text = ears.feed(mono, level)
+            kind, text = ears.feed(mono, level, armed=armed)
 
             if not armed:
                 if kind == "wake":
@@ -774,6 +863,19 @@ def main():
                         log("ELBERR", "woke up.")
                     log("ELBERR", f"wake phrase heard ({text}).")
                     ears.reset_cmd()
+                    # Drop audio that was captured BEFORE/DURING the wake
+                    # phrase: otherwise the command recogniser hears the
+                    # wake phrase itself and answers that instead of the
+                    # command that follows.
+                    dropped = 0
+                    while True:
+                        try:
+                            _AUDIO_Q.get_nowait()
+                            dropped += 1
+                        except queue.Empty:
+                            break
+                    if dropped:
+                        log("ELBERR", f"dropped {dropped} stale audio chunk(s).")
                     armed = True
                     silence = 0
                     blip()  # "I'm listening"
@@ -792,6 +894,7 @@ def main():
                 armed = False
                 ears.reset_cmd()
                 set_mood("normal")
+                _drop_stale_audio()  # the reply's own audio is stale
                 continue
             if not text:
                 silence += 1
