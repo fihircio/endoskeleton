@@ -63,12 +63,30 @@ def cmd_reset(s, _):
 
 
 def cmd_move(s, args):
+    """Enable + move in ONE session.
+
+    The bridge has a short command timeout (it faults if no valid message
+    arrives), so sending 'enable' and 'move' from separate processes means
+    the move arrives after the bridge already faulted and is rejected.
+    """
     if len(args) % 2:
         sys.exit("move needs joint value pairs")
     joints = {}
     for name, val in zip(args[0::2], args[1::2]):
         joints[name] = float(val)
-    print(send(s, {"joints": joints}, 2.0))
+    # enable first (same session, milliseconds apart)
+    s.write((json.dumps({"enable": True}) + "\n").encode())
+    time.sleep(0.05)
+    s.write((json.dumps({"joints": joints}) + "\n").encode())
+    # keep the command alive so the bridge does not time out mid-move
+    t0 = time.time()
+    while time.time() - t0 < 2.0:
+        s.write((json.dumps({"joints": joints}) + "\n").encode())
+        time.sleep(0.2)
+        line = s.readline().decode(errors="replace").strip()
+        if line:
+            print(line)
+            break
 
 
 def cmd_watch(s, _):

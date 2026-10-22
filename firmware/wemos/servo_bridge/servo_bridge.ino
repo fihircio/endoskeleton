@@ -14,8 +14,8 @@
 //     {"enable":false}                -> ACTIVE -> DISABLED (PWM off)
 //     {"estop":true}                  -> ANY -> EMERGENCY_STOP (latched, PWM off)
 //     {"reset":true}                  -> EMERGENCY_STOP -> DISABLED
-//     {"joints":{"left_elbow_pitch":1.57,"right_elbow_pitch":1.57}}  (radians, ACTIVE only)
-//     PCA9685 channels: left_elbow_pitch=2, right_elbow_pitch=4
+//     {"joints":{"left_neck_pan":1.0,"up_neck_tilt":0.6}}  (radians, ACTIVE only)
+//     PCA9685 channels: left_neck_pan=1, up_neck_tilt=4
 //   Wemos -> Pi (2 Hz status + replies):
 //     {"state":"ACTIVE","positions":{"left_elbow_pitch":1.56,...},"t_ms":12345}
 //     {"error":"unknown joint foo"}   (non-fatal, stays ACTIVE)
@@ -39,7 +39,10 @@
 #define PIN_LED D4          // built-in LED, active low (status)
 
 #define PWM_FREQ_HZ 50
-#define CMD_TIMEOUT_MS 500
+// Bridge faults (holds last PWM) if no valid message arrives in this window.
+// The Pi must therefore send commands at >0.5 Hz; 2 s is comfortable for
+// both the ROS driver and manual testing.
+#define CMD_TIMEOUT_MS 2000
 #define STATUS_MS 500
 
 struct Joint {
@@ -56,8 +59,9 @@ struct Joint {
 };
 
 Joint joints[] = {
-  {"left_elbow_pitch",  2, 0.17, 2.97, 1.57, 10.0, 170.0,  500, 2500, false, 1.047f, 1.57, 1.57},
-  {"right_elbow_pitch", 4, 0.17, 2.97, 1.57, 10.0, 170.0,  500, 2500, true,  1.047f, 1.57, 1.57},
+  // name            ch  jmin  jmax  init  minDeg maxDeg pwmMin pwmMax rev  speed   pos   target
+  {"left_neck_pan",  1, 0.35, 2.79, 1.57, 10.0, 170.0, 1000, 2000, false, 1.571f, 1.57, 1.57},
+  {"up_neck_tilt",    4, 0.35, 2.79, 1.57, 10.0, 170.0, 1000, 2000, false, 1.047f, 1.57, 1.57},
 };
 const int NJOINTS = sizeof(joints) / sizeof(joints[0]);
 
