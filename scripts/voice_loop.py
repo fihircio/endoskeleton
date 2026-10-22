@@ -94,7 +94,7 @@ _lag_samples = []
 CHUNK_BYTES = RATE * 2 * 2 // 5      # 0.2 s stereo S16
 
 
-def _set_mic_gain(pct=50):
+def _set_mic_gain(pct=70):
     """Set the mic capture level. USB re-enumeration restores the 95%
     default (clipping), so this runs at startup and after every reset."""
     try:
@@ -224,8 +224,10 @@ class Ears:
         # Vosk-small decodes at ~75% of real time on this Pi, so decoding
         # silence would build an ever-growing backlog (and delay every
         # reply). We only feed the recognisers when there is speech.
-        # Measured on this mic: speech rms 537-4000, room tone 28-50.
-        self.speech_level = 250
+        # Measured on this mic: room tone rms 28-50, a quiet human voice at
+        # desk distance ~140, the speaker next to the mic 537-4000. The
+        # threshold must sit above the noise floor but BELOW a normal voice.
+        self.speech_level = 90
         self.loud_chunks = 0
         self.silent_chunks = 0
 

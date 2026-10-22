@@ -78,15 +78,18 @@ def cmd_move(s, args):
     s.write((json.dumps({"enable": True}) + "\n").encode())
     time.sleep(0.05)
     s.write((json.dumps({"joints": joints}) + "\n").encode())
-    # keep the command alive so the bridge does not time out mid-move
+    # keep the command alive so the bridge does not time out mid-move, then
+    # report the position AFTER the ramp (not the pre-move heartbeat).
     t0 = time.time()
-    while time.time() - t0 < 2.0:
+    last = None
+    while time.time() - t0 < 3.0:
         s.write((json.dumps({"joints": joints}) + "\n").encode())
-        time.sleep(0.2)
+        time.sleep(0.15)
         line = s.readline().decode(errors="replace").strip()
         if line:
-            print(line)
-            break
+            last = line
+    if last:
+        print(last)
 
 
 def cmd_watch(s, _):

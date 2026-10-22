@@ -18,7 +18,7 @@
 #   sudo chmod 440 /etc/sudoers.d/usb-audio-reset
 set -e
 DEV=${1:-auto}
-GAIN=${2:-50}
+GAIN=${2:-70}
 HUB_FALLBACK=1-1
 
 find_dev() {
