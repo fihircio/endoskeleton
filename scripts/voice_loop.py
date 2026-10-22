@@ -562,10 +562,12 @@ def handle_command(text):
         set_mood("normal")
         return True
     # --- neck / servo commands (deterministic; the LLM never drives motors) ---
+    # left_neck_pan is a 360 (continuous) servo: the bridge dead-reckons the
+    # angle and contains it to 0-180 deg, so these are position targets.
     if any(k in t for k in ("look left", "turn left", "look to the left")):
-        return _servo_cmd({"left_neck_pan": 0.90}, "Looking left.")
+        return _servo_cmd({"left_neck_pan": 0.60}, "Looking left.")
     if any(k in t for k in ("look right", "turn right", "look to the right")):
-        return _servo_cmd({"left_neck_pan": 2.20}, "Looking right.")
+        return _servo_cmd({"left_neck_pan": 2.50}, "Looking right.")
     if any(k in t for k in ("look up", "look up at the sky", "tilt up")):
         return _servo_cmd({"up_neck_tilt": 2.10}, "Looking up.")
     if any(k in t for k in ("look down", "tilt down", "look at the floor")):

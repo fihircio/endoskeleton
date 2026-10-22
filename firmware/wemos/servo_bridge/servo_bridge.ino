@@ -14,15 +14,24 @@
 //     {"enable":false}                -> ACTIVE -> DISABLED (PWM off)
 //     {"estop":true}                  -> ANY -> EMERGENCY_STOP (latched, PWM off)
 //     {"reset":true}                  -> EMERGENCY_STOP -> DISABLED
-//     {"joints":{"left_neck_pan":1.0,"up_neck_tilt":0.6}}  (radians, ACTIVE only)
-//     PCA9685 channels: left_neck_pan=1, up_neck_tilt=4
+//     {"joints":{"left_neck_pan":0.9,"up_neck_tilt":2.1}}  (radians, ACTIVE only)
 //   Wemos -> Pi (2 Hz status + replies):
-//     {"state":"ACTIVE","positions":{"left_neck_pan":1.56,...},"t_ms":12345}
+//     {"state":"ACTIVE","positions":{"left_neck_pan":0.9,...},"t_ms":12345}
 //     {"error":"unknown joint foo"}   (non-fatal, stays ACTIVE)
+//
+// JOINT TYPES
+//   positional servo : pulse = f(angle). Holds its angle.
+//   continuous (360) : pulse = stopUs +/- speedUs, i.e. SPEED + DIRECTION.
+//                       Such a servo has no position feedback, so this board
+//                       dead-reckons the angle (est) and drives a bang-bang
+//                       controller. The estimate is clamped to [jmin,jmax] and
+//                       motion is NEVER commanded past those limits, so the
+//                       mechanism cannot be driven into its end stops.
+//                       The reported position is an ESTIMATE, not feedback.
 //
 // Safety (mirrors spec section 26, scoped to this board):
 //   BOOT -> DISABLED -> READY -> ACTIVE; fault -> FAULT; estop -> EMERGENCY_STOP.
-//   No valid message for 500 ms in ACTIVE -> hold last PWM, state FAULT
+//   No valid message for CMD_TIMEOUT_MS in ACTIVE -> hold last PWM, state FAULT
 //   (any valid message recovers to ACTIVE). Boot never drives servos.
 //   On-board LED (D4, active low): slow blink DISABLED, solid ACTIVE,
 //   fast blink FAULT/EMERGENCY_STOP.
@@ -40,28 +49,37 @@
 
 #define PWM_FREQ_HZ 50
 // Bridge faults (holds last PWM) if no valid message arrives in this window.
-// The Pi must therefore send commands at >0.5 Hz; 2 s is comfortable for
-// both the ROS driver and manual testing.
+// The Pi must send commands faster than this; 2 s is comfortable for both the
+// ROS driver and manual testing.
 #define CMD_TIMEOUT_MS 2000
 #define STATUS_MS 500
 
 struct Joint {
   const char *name;
   uint8_t channel;
-  float jmin, jmax;     // joint range, radians (config/joints.yaml)
+  float jmin, jmax;     // allowed range, radians (containment limits)
   float init;           // start pose, radians
-  float minDeg, maxDeg; // servo range, degrees (config/servos.yaml)
+  float minDeg, maxDeg; // servo range, degrees (positional type)
   int pwmMinUs, pwmMaxUs;
   bool reverse;
   float maxSpeedRadS;
-  float pos;            // current (estimated), radians
+  // continuous (360 deg) servo
+  bool continuous;
+  int stopUs;           // pulse that makes it stop (calibrate!)
+  int speedUs;          // pulse deviation from stop for full speed
+  float contRateRadS;   // rad/s at full pulse deviation
+  float deadbandRad;    // position error we accept as "there"
+  float pos;            // current (measured for positional, estimated for 360)
   float target;         // commanded, radians
 };
 
 Joint joints[] = {
-  // name            ch  jmin  jmax  init  minDeg maxDeg pwmMin pwmMax rev  speed   pos   target
-  {"left_neck_pan",  1, 0.35, 2.79, 1.57, 10.0, 170.0, 1000, 2000, false, 1.571f, 1.57, 1.57},
-  {"up_neck_tilt",    4, 0.35, 2.79, 1.57, 10.0, 170.0, 1000, 2000, false, 1.047f, 1.57, 1.57},
+  // name           ch  jmin  jmax  init  minDeg maxDeg pwmMin pwmMax rev  speed
+  //                 continuous stopUs speedUs rate  deadband  pos   target
+  {"left_neck_pan",  1, 0.00, 3.14, 1.57, 10.0, 170.0, 1000, 2000, false, 1.571f,
+      true,  1500,  300,  1.20f,  0.05f, 1.57, 1.57},
+  {"up_neck_tilt",   4, 0.35, 2.79, 1.57, 10.0, 170.0, 1000, 2000, false, 1.047f,
+      false, 1500,  300,  1.00f,  0.03f, 1.57, 1.57},
 };
 const int NJOINTS = sizeof(joints) / sizeof(joints[0]);
 
@@ -96,11 +114,37 @@ void pwmOffAll() {
     pwm.setPWM(joints[i].channel, 0, 4096);  // full off
 }
 
-void driveJoint(Joint *j) {
-  int us = radToUs(j, j->pos);
+void writePulse(uint8_t channel, int us) {
   // 50 Hz: 20 ms period, 12-bit over 4096 ticks
   int ticks = (int)((float)us / 20000.0f * 4096.0f);
-  pwm.setPWM(j->channel, 0, ticks);
+  pwm.setPWM(channel, 0, ticks);
+}
+
+void driveContinuous(Joint *j, float dt) {
+  // Bang-bang position controller over a dead-reckoned angle.
+  float err = j->target - j->pos;
+  int pulse = j->stopUs;                 // default: stop
+  if (fabsf(err) > j->deadbandRad) {
+    int dir = (err > 0) ? 1 : -1;
+    float next = j->pos + dir * j->contRateRadS * dt;
+    if (next < j->jmin || next > j->jmax) {
+      // containment: at the limit -> stop, never push past it
+      pulse = j->stopUs;
+    } else {
+      pulse = j->stopUs + dir * j->speedUs;
+      j->pos = next;
+    }
+  }
+  writePulse(j->channel, pulse);
+}
+
+void drivePositional(Joint *j) {
+  writePulse(j->channel, radToUs(j, j->pos));
+}
+
+void driveJoint(Joint *j, float dt) {
+  if (j->continuous) driveContinuous(j, dt);
+  else drivePositional(j);
 }
 
 void sendStatus() {
@@ -154,6 +198,10 @@ void handleLine(const String &s) {
       // snap targets to current (no jump), then go ACTIVE
       for (int i = 0; i < NJOINTS; i++) joints[i].target = joints[i].pos;
       digitalWrite(PIN_OE, LOW);  // outputs on
+      // continuous servos must be told to STOP before we control them
+      for (int i = 0; i < NJOINTS; i++)
+        if (joints[i].continuous) writePulse(joints[i].channel, joints[i].stopUs);
+      delay(150);
       state = ST_ACTIVE;
     } else if (!en && state != ST_ESTOP) {
       state = ST_DISABLED;
@@ -200,7 +248,7 @@ void setup() {
   }
   state = ST_DISABLED;
   lastMsgMs = millis();
-  StaticJsonDocument<128> boot;
+  StaticJsonDocument<160> boot;
   boot["boot"] = "elberr-servo-bridge";
   boot["state"] = stateName[state];
   serializeJson(boot, Serial);
@@ -232,13 +280,17 @@ void loop() {
     const float dt = 0.02f;  // ~50 Hz loop target
     for (int i = 0; i < NJOINTS; i++) {
       Joint *j = &joints[i];
-      float err = j->target - j->pos;
-      float step = j->maxSpeedRadS * dt;
-      if (err > step) err = step;
-      else if (err < -step) err = -step;
-      if (err != 0.0f) {
-        j->pos += err;
-        driveJoint(j);
+      if (j->continuous) {
+        driveContinuous(j, dt);
+      } else {
+        float err = j->target - j->pos;
+        float step = j->maxSpeedRadS * dt;
+        if (err > step) err = step;
+        else if (err < -step) err = -step;
+        if (err != 0.0f) {
+          j->pos += err;
+          drivePositional(j);
+        }
       }
     }
   }
@@ -248,7 +300,7 @@ void loop() {
     sendStatus();
   }
 
-  // status LED: solid ACTIVE, slow blink DISABLED/READY, fast FAULT/ESTOP
+  // status LED: solid ACTIVE, slow blink DISABLED/READY, fast blink FAULT/ESTOP
   unsigned long blinkMs = (state == ST_ACTIVE) ? 0
     : ((state == ST_FAULT || state == ST_ESTOP) ? 120 : 600);
   if (blinkMs == 0) {

@@ -23,21 +23,35 @@ servos:
     min_angle_deg: 10.0
     max_angle_deg: 170.0
     center_angle_deg: 90.0
-    reverse: true   # mirrored arm — verify on hardware
+    reverse: true
     pwm_min_us: 500
     pwm_max_us: 2500
     max_speed_deg_s: 60.0
-  head_pan:
-    board: board_1
-    channel: 2
-    model: DS3109MG   # verify exact torque/current variant before load (§2.5)
+
+  # --- neck (driven by the Wemos bridge, not the Pi) ---
+  left_neck_pan:
+    board: wemos_pca9685
+    channel: 1
+    model: MG995-360        # continuous rotation: speed+direction, no feedback
+    type: continuous
+    range_deg: [0, 180]     # containment limits for the neck linkage
+    stop_us: 1500           # CALIBRATE: pulse that makes it stop
+    speed_us: 300           # pulse deviation for full speed
+    max_speed_deg_s: 69.0   # rate at full deviation (dead-reckoned)
+    deadband_deg: 2.9
+  up_neck_tilt:
+    board: wemos_pca9685
+    channel: 4
+    model: MG995            # positional
+    type: positional
+    range_deg: [20, 160]
     min_angle_deg: 10.0
     max_angle_deg: 170.0
     center_angle_deg: 90.0
     reverse: false
-    pwm_min_us: 500
-    pwm_max_us: 2500
-    max_speed_deg_s: 90.0
+    pwm_min_us: 1000
+    pwm_max_us: 2000
+    max_speed_deg_s: 60.0
 
 safety:
   command_timeout_s: 0.5   # → HOLD/SAFE on timeout (§12)
