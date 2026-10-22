@@ -353,9 +353,11 @@ class Ears:
         # The cut-off adapts to the room: this mic's noise floor is ~125
         # while speech is 330+, and a quiet voice can be ~190, so a fixed
         # threshold is not safe across mics and rooms.
-        self.speech_level = 70
-        self.noise_floor = 120.0
-        self.gate = 100.0
+        # The floor moves a lot between sessions (hum, AGC, USB resets), so
+        # the hard minimum stays low and the adaptive part does the work.
+        self.speech_level = 25
+        self.noise_floor = 60.0
+        self.gate = 60.0
         self.loud_chunks = 0
         self.silent_chunks = 0
 
